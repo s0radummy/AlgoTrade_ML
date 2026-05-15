@@ -1,0 +1,228 @@
+version: "3.8"
+
+services:
+  # Apache Kafka Broker
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: algotrade-kafka
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+    depends_on:
+      - zookeeper
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - algotrade-network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "kafka-broker-api-versions",
+          "--bootstrap-server",
+          "localhost:9092",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Zookeeper for Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: algotrade-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+    networks:
+      - algotrade-network
+
+  # Redis for caching
+  redis:
+    image: redis:7.2-alpine
+    container_name: algotrade-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - algotrade-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # InfluxDB for time-series data
+  influxdb:
+    image: influxdb:2.7-alpine
+    container_name: algotrade-influxdb
+    environment:
+      INFLUXDB_DB: stock_data
+      INFLUXDB_ADMIN_USER: admin
+      INFLUXDB_ADMIN_PASSWORD: admin_password
+      INFLUXDB_BUCKET: stocks
+      INFLUXDB_ORG: algotrade
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+    networks:
+      - algotrade-network
+    healthcheck:
+      test: ["CMD", "influx", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Kafka Producer (KiteConnect WebSocket → Kafka)
+  producer:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.producer
+    container_name: algotrade-producer
+    environment:
+      KITE_API_KEY: ${KITE_API_KEY}
+      KITE_API_SECRET: ${KITE_API_SECRET}
+      KITE_USER_ID: ${KITE_USER_ID}
+      KITE_PASSWORD: ${KITE_PASSWORD}
+      KITE_TWO_FA: ${KITE_TWO_FA}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      REDIS_HOST: redis
+      LOG_LEVEL: ${LOG_LEVEL}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - algotrade-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Inference Consumer (Kafka → TFT → Redis)
+  inference-consumer:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consumer
+    container_name: algotrade-inference-consumer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      REDIS_HOST: redis
+      LOG_LEVEL: ${LOG_LEVEL}
+      PYTHONUNBUFFERED: 1
+    command: python -m src.consumers.inference_consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - algotrade-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Viz Consumer (Kafka → Redis state)
+  viz-consumer:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consumer
+    container_name: algotrade-viz-consumer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      REDIS_HOST: redis
+      LOG_LEVEL: ${LOG_LEVEL}
+      PYTHONUNBUFFERED: 1
+    command: python -m src.consumers.viz_consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - algotrade-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Persistence Consumer (Kafka → InfluxDB)
+  persistence-consumer:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consumer
+    container_name: algotrade-persistence-consumer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      INFLUXDB_HOST: influxdb
+      LOG_LEVEL: ${LOG_LEVEL}
+      PYTHONUNBUFFERED: 1
+    command: python -m src.consumers.persistence_consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    networks:
+      - algotrade-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # FastAPI REST API
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: algotrade-api
+    environment:
+      REDIS_HOST: redis
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      LOG_LEVEL: ${LOG_LEVEL}
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - algotrade-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  kafka-data:
+  zookeeper-data:
+  redis-data:
+  influxdb-data:
+
+networks:
+  algotrade-network:
+    driver: bridge
