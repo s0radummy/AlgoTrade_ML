@@ -4,11 +4,11 @@ import os
 
 class Settings(BaseSettings):
     # KiteConnect API
-    kite_api_key: str = "your_api_key_here"
-    kite_api_secret: str = "your_api_secret_here"
-    kite_user_id: str = "your_user_id_here"
-    kite_password: str = "your_password_here"
-    kite_two_fa: str = "your_two_fa_here"
+    kite_api_key: str = ""
+    kite_api_secret: str = ""
+    kite_user_id: str = ""
+    kite_password: str = ""
+    kite_two_fa: str = ""
 
     # Kafka
     kafka_bootstrap_servers: str = "localhost:9092"
