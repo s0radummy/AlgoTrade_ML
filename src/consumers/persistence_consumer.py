@@ -38,7 +38,7 @@ class PersistenceConsumer:
             self.client = InfluxDBClient(
                 url=f"http://{settings.influxdb_host}:{settings.influxdb_port}",
                 org=settings.influxdb_org,
-                token="dummy_token",  # Change to real token in production
+                token=settings.influxdb_token,
             )
             self.write_api = self.client.write_api(write_type=SYNCHRONOUS)
             logger.info("InfluxDB client initialized")

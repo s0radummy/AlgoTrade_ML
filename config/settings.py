@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     influxdb_password: str = "admin_password"
     influxdb_bucket: str = "stocks"
     influxdb_org: str = "algotrade"
+    influxdb_token: str = "algotrade-dev-token-2024"
 
     # API
     api_host: str = "0.0.0.0"

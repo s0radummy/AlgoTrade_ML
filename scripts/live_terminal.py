@@ -1,12 +1,11 @@
 """
 Live stock data terminal display using KiteConnect WebSocket.
 
-Auth flow (fully automatic after first browser login):
-  1. Starts a local server on http://localhost:8000 to catch the callback
-  2. Opens the KiteConnect login page in your browser
-  3. You log in once (user ID + password + TOTP from your app)
-  4. Click Authorize — the callback is captured automatically
-  5. Access token is cached for the rest of the trading day
+Auth flow (fully automated — no browser required):
+  1. Logs in with KITE_USER_ID + KITE_PASSWORD from .env
+  2. Submits TOTP using KITE_TWO_FA secret from .env
+  3. Exchanges request_token for access_token
+  4. Token is cached in .kite_session.json for the rest of the trading day
 
 Run: py scripts/live_terminal.py
 """
@@ -15,73 +14,74 @@ import json
 import os
 import sys
 import threading
-import webbrowser
+import time
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
+import pyotp
+import requests
 from dotenv import load_dotenv
 from kiteconnect import KiteConnect, KiteTicker
 
 load_dotenv()
 
-API_KEY  = os.getenv("KITE_API_KEY", "")
-API_SECRET = os.getenv("KITE_API_SECRET", "")
-STOCKS   = [s.strip() for s in os.getenv("STOCKS", "RELIANCE,INFY,TCS,WIPRO,LT,ASIANPAINT").split(",")]
-
-SESSION_CACHE  = ".kite_session.json"
-CALLBACK_PORT  = 8000
-CALLBACK_PATH  = "/kite/callback"
-
-# Shared state between HTTP handler and main thread
-_captured_token: dict = {}
+API_KEY     = os.getenv("KITE_API_KEY", "")
+API_SECRET  = os.getenv("KITE_API_SECRET", "")
+USER_ID     = os.getenv("KITE_USER_ID", "")
+PASSWORD    = os.getenv("KITE_PASSWORD", "")
+TOTP_SECRET = os.getenv("KITE_TWO_FA", "").strip()
+STOCKS      = [s.strip() for s in os.getenv("STOCKS", "RELIANCE,INFY,TCS,WIPRO,LT,ASIANPAINT").split(",")]
+SESSION_CACHE = ".kite_session.json"
 
 
-class CallbackHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == CALLBACK_PATH:
-            params = parse_qs(parsed.query)
-            token = params.get("request_token", [None])[0]
-            if token:
-                _captured_token["value"] = token
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html")
-                self.end_headers()
-                self.wfile.write(b"<h2>Authorized! You can close this tab and return to the terminal.</h2>")
-            else:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(b"Missing request_token")
-        else:
-            self.send_response(404)
-            self.end_headers()
+def auto_login() -> str:
+    """Login with user_id + password + TOTP — returns a fresh access_token."""
+    print("Logging in to KiteConnect...")
 
-    def log_message(self, *args):
-        pass  # suppress server access logs
+    session = requests.Session()
 
+    r = session.post(
+        "https://kite.zerodha.com/api/login",
+        data={"user_id": USER_ID, "password": PASSWORD},
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("status") != "success":
+        raise RuntimeError(f"Login failed: {body.get('message', body)}")
+    request_id = body["data"]["request_id"]
+    print("  [1/3] Password OK")
 
-def browser_login() -> str:
-    """Open browser login, capture request_token via local callback server."""
-    server = HTTPServer(("localhost", CALLBACK_PORT), CallbackHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    totp_code = pyotp.TOTP(TOTP_SECRET).now()
+    r = session.post(
+        "https://kite.zerodha.com/api/twofa",
+        data={
+            "user_id":     USER_ID,
+            "request_id":  request_id,
+            "twofa_value": totp_code,
+            "twofa_type":  "totp",
+        },
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("status") != "success":
+        raise RuntimeError(f"TOTP failed: {body.get('message', body)}")
+    print("  [2/3] TOTP OK")
 
-    login_url = KiteConnect(api_key=API_KEY).login_url()
-    print(f"\nOpening KiteConnect login in your browser...")
-    print(f"  1. Log in with your Zerodha credentials + TOTP")
-    print(f"  2. Click Authorize")
-    print(f"  3. Return here — the token is captured automatically\n")
-    webbrowser.open(login_url)
+    login_url = f"https://kite.zerodha.com/connect/login?api_key={API_KEY}&v=3"
+    request_token = None
+    try:
+        r = session.get(login_url, allow_redirects=True, timeout=10)
+        request_token = parse_qs(urlparse(r.url).query).get("request_token", [None])[0]
+    except requests.exceptions.ConnectionError as e:
+        if e.request is not None:
+            request_token = parse_qs(urlparse(str(e.request.url)).query).get("request_token", [None])[0]
+    if not request_token:
+        raise RuntimeError(
+            "Could not extract request_token from the login redirect.\n"
+            "Check that KITE_API_KEY in .env matches your KiteConnect app."
+        )
+    print("  [3/3] request_token captured")
 
-    print("Waiting for authorization...", end="", flush=True)
-    while "value" not in _captured_token:
-        import time; time.sleep(0.5)
-        print(".", end="", flush=True)
-    server.shutdown()
-    print(" done.\n")
-
-    request_token = _captured_token["value"]
     kite = KiteConnect(api_key=API_KEY)
     data = kite.generate_session(request_token, api_secret=API_SECRET)
     access_token = data["access_token"]
@@ -89,7 +89,7 @@ def browser_login() -> str:
     with open(SESSION_CACHE, "w") as f:
         json.dump({"access_token": access_token, "date": datetime.today().strftime("%Y-%m-%d")}, f)
 
-    print("Session cached for today.")
+    print("  Session cached for today.\n")
     return access_token
 
 
@@ -99,9 +99,17 @@ def get_access_token() -> str:
         with open(SESSION_CACHE) as f:
             cached = json.load(f)
         if cached.get("date") == today:
-            print(f"Using cached session ({today}).")
-            return cached["access_token"]
-    return browser_login()
+            token = cached["access_token"]
+            try:
+                test = KiteConnect(api_key=API_KEY)
+                test.set_access_token(token)
+                test.profile()
+                print(f"Cached session valid ({today}) — skipping login.")
+                return token
+            except Exception:
+                print("Cached token rejected — re-authenticating...")
+                os.remove(SESSION_CACHE)
+    return auto_login()
 
 
 def resolve_tokens(kite: KiteConnect, symbols: list) -> dict:
