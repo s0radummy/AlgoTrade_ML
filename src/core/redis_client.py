@@ -1,40 +1,51 @@
 import redis
-from typing import Any, Optional
+import threading
+from typing import Optional
 from config.settings import settings
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
+
 class RedisClient:
     _instance = None
+    _class_lock = threading.Lock()
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialize()
+            with cls._class_lock:
+                if cls._instance is None:
+                    instance = super().__new__(cls)
+                    instance._connected = False
+                    instance._conn_lock = threading.Lock()
+                    instance.pool = None
+                    instance.client = None
+                    cls._instance = instance
         return cls._instance
 
+    def _ensure_connected(self):
+        """Connect on first use — safe to call from any thread."""
+        if not self._connected:
+            with self._conn_lock:
+                if not self._connected:
+                    self._initialize()
+                    self._connected = True
+
     def _initialize(self):
-        """Initialize Redis connection with pooling."""
-        try:
-            self.pool = redis.ConnectionPool(
-                host=settings.redis_host,
-                port=settings.redis_port,
-                db=settings.redis_db,
-                password=settings.redis_password,
-                decode_responses=True,
-                max_connections=10,
-            )
-            self.client = redis.Redis(connection_pool=self.pool)
-            # Test connection
-            self.client.ping()
-            logger.info(f"Redis connected to {settings.redis_host}:{settings.redis_port}")
-        except Exception as e:
-            logger.error(f"Failed to connect to Redis: {e}")
-            raise
+        self.pool = redis.ConnectionPool(
+            host=settings.redis_host,
+            port=settings.redis_port,
+            db=settings.redis_db,
+            password=settings.redis_password,
+            decode_responses=True,
+            max_connections=10,
+        )
+        self.client = redis.Redis(connection_pool=self.pool)
+        self.client.ping()
+        logger.info(f"Redis connected to {settings.redis_host}:{settings.redis_port}")
 
     def get(self, key: str) -> Optional[str]:
-        """Get a value from Redis."""
+        self._ensure_connected()
         try:
             return self.client.get(key)
         except Exception as e:
@@ -42,7 +53,7 @@ class RedisClient:
             return None
 
     def set(self, key: str, value: str, ttl: Optional[int] = None) -> bool:
-        """Set a value in Redis."""
+        self._ensure_connected()
         try:
             if ttl:
                 self.client.setex(key, ttl, value)
@@ -54,7 +65,7 @@ class RedisClient:
             return False
 
     def hset(self, key: str, mapping: dict, ttl: Optional[int] = None) -> bool:
-        """Set a hash in Redis."""
+        self._ensure_connected()
         try:
             self.client.hset(key, mapping=mapping)
             if ttl:
@@ -65,7 +76,7 @@ class RedisClient:
             return False
 
     def hget(self, key: str, field: str) -> Optional[str]:
-        """Get a field from a Redis hash."""
+        self._ensure_connected()
         try:
             return self.client.hget(key, field)
         except Exception as e:
@@ -73,7 +84,7 @@ class RedisClient:
             return None
 
     def hgetall(self, key: str) -> dict:
-        """Get all fields from a Redis hash."""
+        self._ensure_connected()
         try:
             return self.client.hgetall(key)
         except Exception as e:
@@ -81,7 +92,7 @@ class RedisClient:
             return {}
 
     def delete(self, key: str) -> bool:
-        """Delete a key from Redis."""
+        self._ensure_connected()
         try:
             self.client.delete(key)
             return True
@@ -90,7 +101,7 @@ class RedisClient:
             return False
 
     def publish(self, channel: str, message: str) -> int:
-        """Publish a message to a Redis channel."""
+        self._ensure_connected()
         try:
             return self.client.publish(channel, message)
         except Exception as e:
@@ -98,12 +109,14 @@ class RedisClient:
             return 0
 
     def close(self):
-        """Close Redis connection."""
-        try:
-            self.pool.disconnect()
-            logger.info("Redis connection closed")
-        except Exception as e:
-            logger.error(f"Error closing Redis connection: {e}")
+        if self._connected and self.pool:
+            try:
+                self.pool.disconnect()
+                self._connected = False
+                logger.info("Redis connection closed")
+            except Exception as e:
+                logger.error(f"Error closing Redis connection: {e}")
 
-# Singleton instance
+
+# Singleton instance — safe to import without Redis running
 redis_client = RedisClient()

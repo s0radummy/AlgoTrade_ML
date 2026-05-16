@@ -55,8 +55,8 @@ models/*.pth
 models/*.pt
 !models/.gitkeep
 
-# Data
-data/
+# Data (root-level only — src/data/ is source code, not raw data)
+/data/
 *.csv
 *.json
 
