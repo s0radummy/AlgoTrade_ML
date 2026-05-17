@@ -65,3 +65,6 @@ dump.rdb
 
 # InfluxDB
 data/influxdb/
+
+# Claude Code internal workspace
+.claude/worktrees/

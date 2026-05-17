@@ -1,6 +1,6 @@
 # AlgoTrading Project — Current Status
 
-_Last updated: 2026-05-16_
+_Last updated: 2026-05-17_
 
 ---
 
@@ -31,6 +31,31 @@ _Last updated: 2026-05-16_
 - **`tests/test_tft_model.py`:** Tests TFT forward pass, output shapes `(batch, 5, 5)`, no NaN values, CPU inference. All pass.
 - **`tests/test_validators.py`:** Tests valid tick acceptance, missing fields, negative price, outlier detection (>5% jump), batch validation. All pass.
 
+### 6. Historical Data — KiteConnect API Fetch
+- **Script:** `scripts/fetch_historical_data.py`
+- **What it does:** Bulk-fetches up to 3 years of 1-minute OHLCV candles for Nifty 50 stocks via KiteConnect historical data API. Resumable (skips already-fetched data). Rate-limited to ≤3 req/sec. Saves one Parquet file per stock to `data/historical/`.
+- **Result:** 13,060,164 candles saved across 47 stocks. 3 stocks not fetched: LTIM, TATAMOTORS, ZOMATO (likely symbol resolution failure during the run).
+- **Status:** Completed. Data is on disk and excluded from git (per `.gitignore`).
+
+### 7. TFT Model Architecture — Full Paper Implementation
+- **File:** `src/models/tft_model.py`
+- **What it does:** Full TFT from Lim et al. (2021). Implements GRN (Gated Residual Network), VSN (Variable Selection Network), LSTM encoder-decoder initialised from static context vectors, temporal self-attention, and a quantile regression output head.
+- **Input:** `static_covariates (B,32)`, `past_inputs (B,60,7)`, `future_inputs (B,5,4)`
+- **Output:** `(B, 5, 5)` — 5 quantiles (P10/P30/P50/P70/P90) for 5 future steps
+- **Status:** Architecture complete, sanity-checked (forward pass, output shape, no NaN, parameter count).
+
+### 8. Dataset — Sliding Window Loader
+- **File:** `src/data/dataset.py`
+- **What it does:** PyTorch `Dataset` over 1-minute OHLCV Parquet files. Filters to market hours (09:15–15:30 IST), detects session gaps (excludes cross-day windows), computes 7 log-return features and 4 cyclical calendar features, splits train/val by date (last 14 days = val).
+- **Status:** Implemented and structurally verified. Not yet run against the actual 13M-candle dataset end-to-end in a benchmark.
+
+### 9. TFT Model Training — First Run Completed
+- **File:** `src/models/training.py`
+- **What happened:** Training was run overnight on the 13M-candle dataset. The training script used pinball (quantile) loss, Adam optimizer, ReduceLROnPlateau scheduler, early stopping (patience=5).
+- **Checkpoint:** `models/tft_v1.pth` — epoch 1, val_loss = 0.000180 (4.87 MB on disk, git-ignored).
+- **Caveat:** Checkpoint was saved at epoch 1, meaning epoch 1 was the best validation loss achieved. Training may have triggered early stopping after epochs 2–6 without improvement — this is worth investigating. We do not currently know the training/validation loss curve beyond epoch 1's best.
+- **Status:** A trained checkpoint exists. It is the first real run; we have not yet validated whether the model is learning meaningfully or overfitting.
+
 ---
 
 ## What Is Written and Structurally Complete (But Not End-to-End Tested)
@@ -46,8 +71,6 @@ These files are fully implemented and reviewed. They will work once all Docker s
 | `src/consumers/persistence_consumer.py` | Kafka → InfluxDB batch writes (1000-tick batches, manual offset commit) | Depends on influxdb_client; soft failure if unavailable |
 | `src/data/instrument_loader.py` | Stock metadata cache with sector embeddings and market-cap normalization | Only 6 hardcoded stocks; placeholder for full KiteConnect instrument API |
 | `src/data/tick_validator.py` | Required field checks, price range validation, per-stock outlier detection (5% threshold) | None — runs standalone |
-| `src/models/tft_model.py` | Full PyTorch TFT: static embeddings + 60-tick encoder + quantile head → (batch, 5, 5) | None — runs standalone |
-| `src/models/training.py` | Training loop with pinball loss, ReduceLROnPlateau, early stopping, checkpointing | None — runs standalone with dummy data |
 | `src/models/model_manager.py` | Load/serve TFT weights, cache predictions in Redis, circuit-breaker fallback | Depends on redis_client; falls back to random model if weights missing |
 | `src/api/app.py` | FastAPI: /health, /predict/{symbol}, /history/{symbol}, /stocks, /stats, /model/version | Cascading singleton deps; /history InfluxDB query not yet implemented |
 | `src/utils/logger.py` | Structured JSON logging with rotating file handler (10MB, 7 backups) | None — runs standalone |
@@ -57,8 +80,8 @@ These files are fully implemented and reviewed. They will work once all Docker s
 
 ## What Does Not Exist Yet
 
-- **Trained model weights** — `models/tft_v1.pth` does not exist. `scripts/generate_model.py` can create a random checkpoint for testing, but no real trained model exists yet. Training requires historical tick data.
-- **InfluxDB historical data** — Only the 49 snapshot ticks from verification runs. No real market session data has been persisted yet.
+- **Validated model** — `models/tft_v1.pth` exists but has not been evaluated. No directional accuracy, RMSE, or MAE numbers. No loss curve analysis. The best checkpoint is from epoch 1, which is suspicious.
+- **3 missing stocks in historical data** — LTIM, TATAMOTORS, ZOMATO not fetched (47/50 stocks present). Reason unknown — likely a symbol resolution failure. Easy to re-fetch.
 - **`instrument_loader.py` full stock list** — Currently hardcodes 6 stocks. Needs to be wired to KiteConnect's instrument API to serve all 50 Nifty stocks.
 - **`/history` endpoint** — Stub exists in `src/api/app.py` but the InfluxDB Flux query is not implemented.
 - **Dead Letter Queue** — `tick_validator.send_to_dlq()` logs to `logger.error` instead of publishing to an actual Kafka DLQ topic.
@@ -124,12 +147,23 @@ py scripts/test_kafka.py          # Kafka connectivity + round-trip test
 py -m pytest tests/ -v            # Unit tests (TFT model + validators)
 ```
 
+### Historical data fetch (run once, off-market hours)
+```
+py scripts/fetch_historical_data.py           # full Nifty 50
+py scripts/fetch_historical_data.py --symbol LTIM   # re-fetch missing stocks
+```
+
+### TFT training (run off-market hours)
+```
+py -m src.models.training          # trains on data/historical/, saves models/tft_v1.pth
+```
+
 ---
 
-## The Immediate Next Steps
+## Immediate Next Steps (Model Validation Phase)
 
-1. **Fix module-load singletons** — defer instantiation so consumers can start regardless of service availability order
-2. **Run first real market session** (Monday 9:15 AM IST) — `kite_to_kafka.py` + `verify_consumers.py` in parallel; confirm continuous tick flow in both stores
-3. **Wire inference consumer** — connect `inference_consumer.py` to the live Kafka topic; verify predictions appear in Redis under `PRED:<SYMBOL>:quantiles`
-4. **Generate/train model** — run `scripts/generate_model.py` for a dev checkpoint, then plan real training once enough tick history is in InfluxDB
-5. **Build Docker images** — create `docker/Dockerfile.producer` and `docker/Dockerfile.consumer` so the full `docker-compose up` stack can run
+1. **Evaluate the trained checkpoint** — run `scripts/evaluate_model.py` (to be created): compute directional accuracy, MAE, RMSE, and quantile calibration on the held-out 14-day val set. Inspect the loss curve to understand why epoch 1 was the best.
+2. **Re-fetch missing stocks** — run `fetch_historical_data.py --symbol LTIM`, `--symbol TATAMOTORS`, `--symbol ZOMATO` to complete the 50-stock dataset.
+3. **Retrain if needed** — based on evaluation results, decide whether to adjust architecture (hidden_dim, num_heads, dropout), training config (LR, batch_size), or feature engineering.
+4. **Wire inference consumer** — connect `inference_consumer.py` to the live Kafka topic using the validated checkpoint; verify predictions appear in Redis under `PRED:<SYMBOL>:quantiles`.
+5. **Build Docker images** — create `docker/Dockerfile.producer` and `docker/Dockerfile.consumer` so the full `docker-compose up` stack can run.
