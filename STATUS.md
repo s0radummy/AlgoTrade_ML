@@ -1,6 +1,6 @@
 # AlgoTrading Project — Current Status
 
-_Last updated: 2026-05-17_
+_Last updated: 2026-05-18_
 
 ---
 
@@ -14,18 +14,21 @@ _Last updated: 2026-05-17_
 ### 2. Kafka Producer + Consumer — Message Pipeline
 - **Scripts:** `scripts/kafka_live_view.py` (mock data), `scripts/test_kafka.py` (round-trip diagnostic), `scripts/kite_to_kafka.py` (live bridge)
 - **Infrastructure:** Docker Compose brings up `algotrade-kafka` + `algotrade-zookeeper`. Dual-listener: `kafka:9092` (container-to-container), `localhost:29092` (host scripts).
-- **Live bridge:** `on_ticks` callback uses async `producer.send()` with callbacks — never blocks the Twisted reactor thread. Confirmed 49 snapshot ticks flowing on connect.
-- **Status:** Working. Round-trip latency confirmed well under 100ms locally.
+- **Live bridge:** `on_ticks` callback uses async `producer.send()` with callbacks — never blocks the Twisted reactor thread. Confirmed 50 stocks subscribed with snapshot burst on connect.
+- **Measured RTT (2026-05-18, live market hours):** avg 27.6ms · p50 15.3ms · p99 28.8ms — well inside 100ms SLA.
+- **Note:** On fresh Docker start, `stock-quotes` is auto-created with 1 partition. Must be manually altered to 25 before running: `docker exec algotrade-kafka kafka-topics --bootstrap-server localhost:9092 --alter --topic stock-quotes --partitions 25`
+- **Status:** Working. 1576 ticks produced and confirmed in a 10-second live test.
 
 ### 3. Redis Consumer — Live State
 - **Script:** `scripts/verify_consumers.py` (Redis thread)
 - **What it does:** Reads from `stock-quotes` Kafka topic, writes `STOCK:<SYMBOL>` hashes (LTP, OHLC, Volume, Change, Last_Updated) with 1-hour TTL.
-- **Status:** Working. 49 snapshot ticks written and verified via `redis-cli HGETALL STOCK:RELIANCE`.
+- **Status:** Working. 49 `STOCK:*` keys written and verified via `redis-cli KEYS "STOCK:*"` and `redis-cli HGETALL STOCK:RELIANCE` (2026-05-18).
 
 ### 4. InfluxDB Consumer — Time-Series Persistence
 - **Script:** `scripts/verify_consumers.py` (InfluxDB thread)
-- **What it does:** Reads from `stock-quotes` Kafka topic, writes batched `Point` records to the `stocks` bucket using synchronous write API.
-- **Status:** Working. 49 snapshot ticks written and verified via Flux query (`from(bucket:"stocks") |> range(start:-1h) |> count()`).
+- **What it does:** Reads from `stock-quotes` Kafka topic, writes batched `Point` records (batch size 50) to the `stocks` bucket using synchronous write API.
+- **Bug fixed (2026-05-18, commit f809ecb):** Points were not setting `.time()`, so all points in a batch received the same nanosecond server write timestamp. Multiple ticks for the same stock within a batch were silently deduplicated by InfluxDB — only 22% of written points (411/1850) survived. Fix: each `Point` now uses the tick's own UTC timestamp from the KiteConnect payload. Survival rate is now 97% (1796/1850); the remaining 3% are genuine same-microsecond duplicate ticks.
+- **Status:** Working. 1796 records confirmed in InfluxDB after a 1576-message replay (2026-05-18).
 
 ### 5. Unit Tests
 - **`tests/test_tft_model.py`:** Tests TFT forward pass, output shapes `(batch, 5, 5)`, no NaN values, CPU inference. All pass.
@@ -102,7 +105,12 @@ These files are fully implemented and reviewed. They will work once all Docker s
 ### 2. Kafka Offset Commit in Persistence Consumer
 `persistence_consumer.py` sets `enable_auto_commit=False` but never calls `consumer.commit()` after a successful InfluxDB write. Messages will be re-processed on restart.
 
-### 3. Outlier Threshold on First Run
+### 3. Kafka Topic Auto-Created with Wrong Partition Count
+When Docker starts fresh and a producer connects before the topic is manually created, Kafka auto-creates `stock-quotes` with 1 partition (broker default). All ticks then land on partition 0, breaking the per-stock ordering guarantee. Must run the `--alter --partitions 25` command once after every fresh Docker volume reset.
+
+**Workaround:** Add topic pre-creation to a startup script or docker-compose `command` hook.
+
+### 4. Outlier Threshold on First Run
 `tick_validator.py` rejects ticks with >5% price change from the previous seen price. On the initial 60-tick warm-up window, stocks with high volatility at open could be silently dropped by the inference consumer.
 
 ---
@@ -157,6 +165,87 @@ py scripts/fetch_historical_data.py --symbol LTIM   # re-fetch missing stocks
 ```
 py -m src.models.training          # trains on data/historical/, saves models/tft_v1.pth
 ```
+
+---
+
+## Model Evaluation — Findings (2026-05-17)
+
+This section records what we learned from the first evaluation run of `models/tft_v1.pth`.
+Do not delete — this is a reference point for future training runs.
+
+### Hard Numbers (Measured, Not Guessed)
+
+| Metric | Value | Interpretation |
+|--------|-------|----------------|
+| Directional accuracy (P50) | 50.20% | Statistically indistinguishable from a coin flip (need >50.23% to be significant at 672K samples) |
+| MAE (P50 vs actual) | 0.000471 | Essentially equal to predicting zero every time |
+| RMSE (P50 vs actual) | 0.000688 | Matches actual log-return std (0.000687) — no better than naive mean predictor |
+| **P50 prediction std** | **0.000008** | **Root of the problem. Actual std is 0.000687 — model output is 86x less variable than the data** |
+| Quantile monotonicity | 100.0% | All quantile outputs are ordered P10 <= P30 <= ... <= P90. No structural defect here. |
+| Val windows evaluated | 146,170 | Across 47 stocks, last 14 days |
+| Best checkpoint epoch | 1 | Training never improved after epoch 1 (patience=5, so ran ~6 epochs total) |
+| Checkpoint val_loss | 0.000180 | Pinball loss; low because predicting ~0 is nearly correct for a near-zero mean distribution |
+
+**Quantile calibration (observed vs expected):**
+
+| Quantile | Expected | Observed | Gap |
+|----------|----------|----------|-----|
+| P10 | 10.0% | 11.57% | +1.57% |
+| P30 | 30.0% | 30.01% | +0.01% |
+| P50 | 50.0% | 46.19% | -3.81% |
+| P70 | 70.0% | 72.25% | +2.25% |
+| P90 | 90.0% | 90.09% | +0.09% |
+
+The outer quantiles (P10, P90) look calibrated. P50 has a -3.81% gap. This is consistent with a near-constant predictor that slightly undershoots the median.
+
+**Per-step directional accuracy:**
+
+All five forecast steps are ~50.2%. There is no decay or improvement across steps — the model treats every horizon identically, which is another symptom of collapsed output.
+
+### What Is Definitely Happening (Confirmed)
+
+The model has collapsed to a near-constant prediction. P50 std is 0.000008 — it outputs almost the same number for every input, regardless of what the past 60 candles look like. In plain terms: the model learned to say "the next return will be approximately zero" for every stock, every tick, every horizon. This technically minimizes the loss (since the true mean is near zero) but carries zero predictive information.
+
+This is not a minor calibration issue. The model is not learning at all.
+
+### Possible Root Causes (Uncertain — Ranked by Confidence)
+
+**High confidence:**
+
+1. **The pinball loss has a degenerate minimum for this target distribution.** 1-minute log returns are mean-zero and symmetric. Predicting zero for P50 is technically the correct median forecast. The quantile loss has no term that rewards variance in predictions — a model that always outputs the same number is never explicitly penalized for being boring. The outer quantiles (P10/P90) are spread just enough to keep calibration reasonable, but P50 never moves.
+
+2. **Training dynamics collapsed in epoch 1, and we have no visibility into why.** The checkpoint is epoch 1, best val_loss. We do not have the training loss curve — only one data point. We do not know whether training loss was also near-degenerate from the start, or whether it diverged from val loss. Any deeper diagnosis without the full curve is partially guesswork.
+
+**Moderate confidence:**
+
+3. **Learning rate too high (1e-3) with large batch (1024).** With ~12,700 gradient steps per epoch, a lr of 1e-3 applied to random initial weights could shoot the optimizer into a flat basin in the first few hundred steps, from which ReduceLROnPlateau cannot recover (it only reduces LR after plateauing, not after falling into a bad basin).
+
+4. **Static covariates are mostly zeros.** Only 3 of 32 static dimensions carry signal (stock hash, sector, market cap). The other 29 are zero. `static_proj` feeds a mostly-zero vector through 4 GRNs to produce context vectors. These context vectors may be near-zero noise, providing no useful conditioning signal to the VSN or LSTM state initialisation.
+
+**Lower confidence (worth checking but not the leading hypothesis):**
+
+5. **Feature scale.** Log returns have std ~0.0007 — very small values. This might affect initial gradient magnitudes flowing back through the linear projection layers. However, the TFT has LayerNorm inside every GRN, which normalises activations regardless of input scale. LayerNorm is specifically scale-invariant, so this is probably a secondary effect at most.
+
+6. **Gap detection edge cases.** If any windows cross overnight gaps (due to timezone handling bugs or mislabeled timestamps), those windows would contain a large spurious overnight log return in the past sequence, acting as noise during training.
+
+7. **Zero-volume candles.** 8% of target log returns are exactly zero. There may be more in the past input windows. These are real market events (no trading in that minute) but they could bias the model toward predicting zero.
+
+### What We Have NOT Checked Yet
+
+- Full training loss curve (train loss per epoch, not just best val checkpoint)
+- Whether the model architecture forward pass is actually computing the paper correctly end-to-end (unit test covers shapes and NaN, but not numerical correctness of each component)
+- Data quality spot-check: do the parquet files have correct timestamps, realistic OHLCV ranges, and no bulk NaN rows?
+- Whether 3 missing stocks (LTIM, TATAMOTORS, ZOMATO) would change training meaningfully
+- Whether the val split (last 14 days) is actually temporally separate or if a bug in the cutoff logic leaks train dates into val
+
+### Agreed Next Step Before Retraining
+
+Run a **diagnostic training pass** on a small subset (3-5 stocks, 30-50 epochs, small batch) with the full loss curve printed every epoch. This costs ~15-30 minutes and will reveal whether:
+- Train loss and val loss are both near-degenerate from epoch 1 (points to loss function or data problem)
+- Train loss improves but val loss doesn't (overfitting)
+- Both improve for a few epochs then plateau (confirms the degenerate basin, and we can tune LR/architecture)
+
+Only after seeing the curve should we commit to a full overnight retrain.
 
 ---
 
