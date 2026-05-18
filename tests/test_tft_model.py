@@ -15,7 +15,7 @@ def test_tft_forward_pass():
 
     batch_size = 2
     static_cov = torch.randn(batch_size, 32)
-    past_inputs = torch.randn(batch_size, 60, 7)
+    past_inputs = torch.randn(batch_size, 60, 11)
     future_inputs = torch.randn(batch_size, 5, 4)
 
     with torch.no_grad():
@@ -31,7 +31,7 @@ def test_tft_device():
     # Test on CPU
     model = model.cpu()
     static_cov = torch.randn(1, 32)
-    past_inputs = torch.randn(1, 60, 7)
+    past_inputs = torch.randn(1, 60, 11)
     future_inputs = torch.randn(1, 5, 4)
 
     with torch.no_grad():

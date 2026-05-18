@@ -122,22 +122,37 @@ def get_access_token() -> str:
 
 # ── Instrument token resolution ───────────────────────────────────────────────
 
+_INDEX_TOKENS = {
+    "NIFTY50": 256265,   # NSE:NIFTY 50 — stable across all KiteConnect accounts
+    "NIFTYBANK": 260105, # NSE:NIFTY BANK
+}
+
+
 def build_token_map(kite: KiteConnect, symbols: list[str]) -> dict[str, int]:
     """
     Returns {symbol: instrument_token} for each symbol found on NSE.
     Downloads the full NSE instrument dump once; no per-symbol requests.
+    Index symbols (NIFTY50, NIFTYBANK) are resolved via hardcoded tokens.
     """
-    print("Downloading NSE instruments list...", flush=True)
-    instruments = kite.instruments("NSE")  # list of dicts
-    nse_map = {inst["tradingsymbol"]: inst["instrument_token"] for inst in instruments}
+    index_syms = [s for s in symbols if s in _INDEX_TOKENS]
+    equity_syms = [s for s in symbols if s not in _INDEX_TOKENS]
 
     token_map = {}
-    for sym in symbols:
-        token = nse_map.get(sym)
-        if token:
-            token_map[sym] = token
-        else:
-            print(f"  [WARN] {sym} not found in NSE instruments — skipping")
+
+    if equity_syms:
+        print("Downloading NSE instruments list...", flush=True)
+        instruments = kite.instruments("NSE")
+        nse_map = {inst["tradingsymbol"]: inst["instrument_token"] for inst in instruments}
+        for sym in equity_syms:
+            token = nse_map.get(sym)
+            if token:
+                token_map[sym] = token
+            else:
+                print(f"  [WARN] {sym} not found in NSE instruments — skipping")
+
+    for sym in index_syms:
+        token_map[sym] = _INDEX_TOKENS[sym]
+        print(f"  Resolved {sym} -> token {_INDEX_TOKENS[sym]} (index, hardcoded)")
 
     print(f"Resolved {len(token_map)}/{len(symbols)} symbols.\n")
     return token_map

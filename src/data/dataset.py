@@ -5,10 +5,22 @@ Each sample is a (past_60, future_5) sliding window. Windows that cross a
 session boundary (end-of-day gap) are automatically excluded.
 
 Tensor shapes returned by __getitem__:
-  static_cov:    (32,)   — stock ID, sector, market-cap embeddings + zero-pad
-  past_inputs:   (60, 7) — 60-min history, all log-based features
-  future_inputs: (5,  4) — calendar features for the 5 target minutes
-  targets:       (5,  1) — log returns for those 5 minutes
+  static_cov:    (32,)    — stock ID, sector one-hot, market-cap, volatility profile
+  past_inputs:   (60, 11) — 60-min history: 7 log-return features + RSI + MACD hist + ATR
+                             + Nifty50 index log-return (col 10)
+  future_inputs: (5,  4)  — calendar features for the 5 target minutes
+  targets:       (5,  1)  — z-scored log returns for those 5 minutes
+
+Target standardization:
+  log_ret targets are z-scored per stock (mean/std computed over full training series).
+  The col-0 (log_ret) channel of past_inputs is also z-scored for consistency.
+  Per-stock (mean, std) are stored in each stock's dict and saved in the checkpoint
+  so inference can denormalize predictions back to raw log-return scale.
+
+Nifty50 feature (col 10):
+  data/historical/NIFTY50.parquet must exist. Fetch with:
+    py scripts/fetch_historical_data.py --symbol NIFTY50
+  If missing, dataset raises a clear error rather than silently training with zeros.
 """
 
 import math
@@ -20,6 +32,8 @@ import pandas as pd
 import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
+
+from src.data.features import compute_rsi, compute_macd_hist, compute_atr
 
 # ── Stock metadata ─────────────────────────────────────────────────────────────
 
@@ -86,17 +100,46 @@ STOCK_META: dict[str, tuple[str, int]] = {
 _LOG_CAP_MIN = math.log10(100_000_000)
 _LOG_CAP_MAX = math.log10(20_000_000_000_000)
 
+# log10(INR) boundaries for 8 market-cap buckets
+_CAP_BUCKET_EDGES = [12.2, 12.4, 12.6, 12.8, 13.0, 13.3, 13.6]
 
-def _build_static_cov(symbol: str) -> np.ndarray:
+
+def _build_static_cov(symbol: str, target_std: float = 0.0007) -> np.ndarray:
+    """
+    Build the 32-dim static covariate vector for a stock.
+
+    Layout (22 of 32 dims are meaningful):
+      0:      stock identity (hash scalar)
+      1:      sector ordinal (0–1 scalar, kept for legacy)
+      2:      log-normalized market cap (–1 to 1)
+      3–12:   sector one-hot (10 dims) — removes false ordinal relationship
+      13:     historical return volatility (target_std / 0.002, clipped [0,1])
+      14–21:  market-cap bucket one-hot (8 buckets by log10 INR)
+      22–31:  reserved zeros
+    """
     sector, cap = STOCK_META.get(symbol, ("IT", 1_000_000_000_000))
-    log_cap = math.log10(max(cap, 1e8))
-    cap_norm = 2.0 * ((log_cap - _LOG_CAP_MIN) / (_LOG_CAP_MAX - _LOG_CAP_MIN)) - 1.0
-    cap_norm = float(np.clip(cap_norm, -1.0, 1.0))
+    sector_idx  = SECTOR_MAP.get(sector, 0)
+    log_cap     = math.log10(max(cap, 1e8))
+    cap_norm    = 2.0 * ((log_cap - _LOG_CAP_MIN) / (_LOG_CAP_MAX - _LOG_CAP_MIN)) - 1.0
+    cap_norm    = float(np.clip(cap_norm, -1.0, 1.0))
 
     vec = np.zeros(32, dtype=np.float32)
-    vec[0] = hash(symbol) % 1000 / 1000.0          # stock identity
-    vec[1] = SECTOR_MAP.get(sector, 0) / 9.0        # sector (0–1)
-    vec[2] = cap_norm                               # log-normalised market cap
+
+    vec[0] = hash(symbol) % 1000 / 1000.0   # stock identity
+    vec[1] = sector_idx / 9.0               # sector ordinal (legacy)
+    vec[2] = cap_norm                        # log-normalised market cap
+
+    # sector one-hot (dims 3–12)
+    vec[3 + sector_idx] = 1.0
+
+    # historical return volatility (dim 13)
+    vec[13] = float(np.clip(target_std / 0.002, 0.0, 1.0))
+
+    # market-cap bucket one-hot (dims 14–21)
+    bucket = int(np.searchsorted(_CAP_BUCKET_EDGES, log_cap))
+    vec[14 + min(bucket, 7)] = 1.0
+
+    # dims 22–31: reserved zeros
     return vec
 
 
@@ -105,7 +148,11 @@ def _build_static_cov(symbol: str) -> np.ndarray:
 class TFTDataset(Dataset):
     """
     Sliding-window dataset over Nifty 50 1-minute OHLCV candles.
-    All price features are expressed as log-returns for stationarity.
+
+    Price features are log-returns (stationarity). Technical indicators
+    (RSI, MACD hist, ATR) are appended as cols 7–9. Log-return targets
+    are z-scored per stock to eliminate the degenerate zero-prediction
+    minimum of the pinball loss.
     """
 
     PAST_LEN   = 60
@@ -119,19 +166,33 @@ class TFTDataset(Dataset):
     def __init__(
         self,
         data_dir: str = "data/historical",
-        split: str = "train",       # "train" or "val"
+        split: str = "train",
         val_days: int = 14,
+        val_start_days: Optional[int] = None,
         symbols: Optional[list[str]] = None,
     ):
-        self.data_dir = data_dir
-        self.split    = split
+        """
+        val_days:       Windows whose last candle is within the last val_days days → val split.
+        val_start_days: If provided (must be > val_days), val windows are restricted to
+                        [now - val_start_days, now - val_days]. Used by walk-forward evaluation
+                        to select non-overlapping windows.
+        """
+        self.data_dir      = data_dir
+        self.split         = split
+        self.val_days      = val_days
+        self.val_start_days = val_start_days
+
+        # Preload Nifty50 1-min log returns indexed by UTC timestamp.
+        # Must be loaded before _load_stock is called for any individual stock.
+        self._nifty_log_ret: Optional[pd.Series] = self._load_nifty(data_dir)
 
         self._stocks: list[dict] = []
         all_stock_idxs: list[np.ndarray] = []
         all_start_idxs: list[np.ndarray] = []
 
         available = sorted(
-            f[:-8] for f in os.listdir(data_dir) if f.endswith(".parquet")
+            f[:-8] for f in os.listdir(data_dir)
+            if f.endswith(".parquet") and f[:-8] != "NIFTY50"
         )
         if symbols:
             available = [s for s in available if s in symbols]
@@ -143,15 +204,31 @@ class TFTDataset(Dataset):
                 continue
             idx = len(self._stocks)
             self._stocks.append(stock)
-            starts = stock.pop("valid_starts")        # (k,) int32
+            starts = stock.pop("valid_starts")
             all_stock_idxs.append(np.full(len(starts), idx, dtype=np.int32))
             all_start_idxs.append(starts)
 
-        # Flat index arrays — much cheaper than a Python list of tuples
         self._win_stock = np.concatenate(all_stock_idxs) if all_stock_idxs else np.array([], dtype=np.int32)
         self._win_start = np.concatenate(all_start_idxs) if all_start_idxs else np.array([], dtype=np.int32)
 
-        print(f"  → {len(self._win_stock):,} windows across {len(self._stocks)} stocks")
+        print(f"  => {len(self._win_stock):,} windows across {len(self._stocks)} stocks")
+
+    @staticmethod
+    def _load_nifty(data_dir: str) -> Optional[pd.Series]:
+        """Load NIFTY50 1-min log returns indexed by UTC timestamp."""
+        path = os.path.join(data_dir, "NIFTY50.parquet")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"NIFTY50.parquet not found at {path}. "
+                "Fetch it first:\n"
+                "  py scripts/fetch_historical_data.py --symbol NIFTY50"
+            )
+        df = pd.read_parquet(path)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        close = df.set_index("timestamp")["close"].astype(np.float64)
+        log_ret = np.log(close / close.shift(1)).fillna(0.0)
+        return log_ret
 
     # ── Per-stock loading ──────────────────────────────────────────────────────
 
@@ -164,8 +241,7 @@ class TFTDataset(Dataset):
         df = df.sort_values("timestamp").reset_index(drop=True)
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
-        # Filter to market hours using UTC time directly
-        # (avoids pytz dependency; 03:45–10:00 UTC = 09:15–15:30 IST)
+        # Filter to market hours (avoids pytz dependency; 03:45–10:00 UTC = 09:15–15:30 IST)
         utc_h = df["timestamp"].dt.hour
         utc_m = df["timestamp"].dt.minute
         utc_minutes = utc_h * 60 + utc_m
@@ -183,7 +259,6 @@ class TFTDataset(Dataset):
         low    = df["low"].to_numpy(dtype=np.float64)
         vol    = df["volume"].to_numpy(dtype=np.float64)
 
-        # prev_close: for row 0 use its own open; otherwise use previous close
         prev_close = np.empty_like(close)
         prev_close[0] = open_[0]
         prev_close[1:] = close[:-1]
@@ -200,32 +275,53 @@ class TFTDataset(Dataset):
             intraday_rng = np.log(high   / np.where(low   > 0, low,   1.0))
             vol_norm     = np.log1p(vol  / mean_vol)
 
-        # (n, 7) — feature order must match inference_consumer.py when updated
+        # Technical indicators (cols 7, 8, 9)
+        rsi       = compute_rsi(close)             # [0, 1]
+        macd_hist = compute_macd_hist(close)       # dimensionless, ~(-0.01, 0.01)
+        atr_norm  = compute_atr(high, low, close)  # dimensionless, ~(0, 0.02)
+
+        # Nifty50 index return (col 10) — separates idiosyncratic from market-wide moves
+        if self._nifty_log_ret is not None:
+            nifty_col = df["timestamp"].map(self._nifty_log_ret).to_numpy(dtype=np.float64)
+            nifty_col = np.where(np.isfinite(nifty_col), nifty_col, 0.0)
+        else:
+            nifty_col = np.zeros(len(df), dtype=np.float64)
+
+        # (n, 11) — feature order must match inference_consumer.py
         features = np.column_stack([
             log_ret, open_ret, high_ret, low_ret,
             intraday_ret, intraday_rng, vol_norm,
+            rsi, macd_hist, atr_norm, nifty_col,
         ]).astype(np.float32)
+        # nan/inf cleanup must happen AFTER all 11 columns are assembled
         features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
+        # ── Per-stock target normalization stats ───────────────────────────────
+        # Computed from the full series so distribution is stable.
+        # Used to z-score col-0 (log_ret) in both past_inputs and targets,
+        # eliminating the degenerate pinball-loss minimum at zero.
+        log_ret_series = features[:, 0]
+        target_mean = float(log_ret_series.mean())
+        target_std  = float(log_ret_series.std())
+        if target_std < 1e-8:
+            target_std = 1.0  # degenerate stock (constant price) — skip
+
         # ── Calendar features (future inputs) ─────────────────────────────────
-        # Position within the 375-minute trading day — cyclically encoded.
-        utc_min_of_day = (df["timestamp"].dt.hour * 60 + df["timestamp"].dt.minute).to_numpy(np.float32)
-        mins_since_open = utc_min_of_day - open_min           # 0 … 374
+        utc_min_of_day  = (df["timestamp"].dt.hour * 60 + df["timestamp"].dt.minute).to_numpy(np.float32)
+        mins_since_open = utc_min_of_day - open_min
         frac = mins_since_open / 375.0
 
         calendar = np.column_stack([
-            np.sin(2 * np.pi * frac),                          # cyclical time (sin)
-            np.cos(2 * np.pi * frac),                          # cyclical time (cos)
-            (df["timestamp"].dt.dayofweek.to_numpy(np.float32)) / 4.0,   # Mon=0 … Fri=1
-            (df["timestamp"].dt.day.to_numpy(np.float32))      / 31.0,   # day of month
+            np.sin(2 * np.pi * frac),
+            np.cos(2 * np.pi * frac),
+            (df["timestamp"].dt.dayofweek.to_numpy(np.float32)) / 4.0,
+            (df["timestamp"].dt.day.to_numpy(np.float32))       / 31.0,
         ]).astype(np.float32)
 
         # ── Gap detection ──────────────────────────────────────────────────────
-        # Timestamps are datetime64[us] — integer values are microseconds.
-        # A gap > 2 minutes between consecutive candles means a session boundary.
-        ts_us = df["timestamp"].astype(np.int64).to_numpy()  # microseconds since epoch
-        diff_min = np.diff(ts_us) / 60_000_000               # us → minutes
-        is_gap = np.zeros(len(df), dtype=bool)
+        ts_us    = df["timestamp"].astype(np.int64).to_numpy()
+        diff_min = np.diff(ts_us) / 60_000_000
+        is_gap   = np.zeros(len(df), dtype=bool)
         is_gap[1:] = diff_min > 2
 
         gap_cumsum = np.cumsum(is_gap.astype(np.int32))
@@ -235,19 +331,22 @@ class TFTDataset(Dataset):
         if n < w:
             return None
 
-        # Window [i … i+w-1] is valid if no gap exists inside it
         end_idx   = np.arange(w - 1, n)
         start_idx = np.arange(0, n - w + 1)
         gap_free  = (gap_cumsum[end_idx] - gap_cumsum[start_idx]) == 0
 
         # ── Time-based train / val split ───────────────────────────────────────
-        cutoff_us = int(
-            (df["timestamp"].max() - pd.Timedelta(days=val_days)).timestamp() * 1e6
-        )
-        win_end_us = ts_us[end_idx]
+        # Anchor on the series max so splits are reproducible per stock, not wall-clock.
+        series_end_us = int(df["timestamp"].max().timestamp() * 1e6)
+        cutoff_us     = series_end_us - val_days * 86_400 * 1_000_000
+        win_end_us    = ts_us[end_idx]
 
         if self.split == "train":
             split_mask = win_end_us < cutoff_us
+        elif self.val_start_days is not None:
+            # Restrict val to a specific window: [series_end - val_start_days, series_end - val_days]
+            start_cutoff_us = series_end_us - self.val_start_days * 86_400 * 1_000_000
+            split_mask = (win_end_us >= cutoff_us) & (win_end_us < start_cutoff_us)
         else:
             split_mask = win_end_us >= cutoff_us
 
@@ -258,10 +357,12 @@ class TFTDataset(Dataset):
 
         return {
             "symbol":       symbol,
-            "features":     features,       # (n, 7)  float32
-            "calendar":     calendar,       # (n, 4)  float32
-            "static_cov":   _build_static_cov(symbol),  # (32,) float32
-            "valid_starts": valid_starts,   # (k,)    int32
+            "features":     features,                                   # (n, 11) float32
+            "calendar":     calendar,                                   # (n,  4) float32
+            "static_cov":   _build_static_cov(symbol, target_std),     # (32,)   float32
+            "target_mean":  target_mean,
+            "target_std":   target_std,
+            "valid_starts": valid_starts,                               # (k,)    int32
         }
 
     # ── Dataset interface ──────────────────────────────────────────────────────
@@ -270,14 +371,25 @@ class TFTDataset(Dataset):
         return len(self._win_stock)
 
     def __getitem__(self, idx: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        s      = self._stocks[self._win_stock[idx]]
-        start  = int(self._win_start[idx])
-        p, f   = self.PAST_LEN, self.FUTURE_LEN
+        s     = self._stocks[self._win_stock[idx]]
+        start = int(self._win_start[idx])
+        p, f  = self.PAST_LEN, self.FUTURE_LEN
 
-        past_inputs   = torch.from_numpy(s["features"][start     : start + p])         # (60, 7)
-        future_inputs = torch.from_numpy(s["calendar"][start + p : start + p + f])     # (5,  4)
-        targets       = torch.from_numpy(s["features"][start + p : start + p + f, :1]) # (5,  1) log_return
-        static_cov    = torch.from_numpy(s["static_cov"])                               # (32,)
+        # Z-score only col 0 (log_ret) of past_inputs; other cols are already well-scaled
+        past_raw       = s["features"][start : start + p].copy()
+        past_raw[:, 0] = (past_raw[:, 0] - s["target_mean"]) / s["target_std"]
+        past_inputs    = torch.from_numpy(past_raw).float()           # (60, 11)
+
+        future_inputs  = torch.from_numpy(
+            s["calendar"][start + p : start + p + f]
+        ).float()                                                      # (5,  4)
+
+        raw_targets    = s["features"][start + p : start + p + f, :1] # (5,  1)
+        targets        = torch.from_numpy(
+            (raw_targets - s["target_mean"]) / s["target_std"]
+        ).float()                                                      # (5,  1) z-scored
+
+        static_cov     = torch.from_numpy(s["static_cov"]).float()    # (32,)
 
         return static_cov, past_inputs, future_inputs, targets
 
@@ -288,11 +400,12 @@ def create_dataloaders(
     data_dir: str = "data/historical",
     batch_size: int = 256,
     val_days: int = 14,
-    num_workers: int = 0,       # keep 0 on Windows; increase on Linux/Mac
+    num_workers: int = 0,
     symbols: Optional[list[str]] = None,
 ) -> tuple[DataLoader, DataLoader]:
     train_ds = TFTDataset(data_dir, split="train", val_days=val_days, symbols=symbols)
     val_ds   = TFTDataset(data_dir, split="val",   val_days=val_days, symbols=symbols)
+    # val_start_days not set here — training uses the standard single-window val split
 
     train_loader = DataLoader(
         train_ds,
@@ -322,6 +435,8 @@ if __name__ == "__main__":
     print(f"  past_inputs:   {tuple(past.shape)}  dtype={past.dtype}")
     print(f"  future_inputs: {tuple(future.shape)}   dtype={future.dtype}")
     print(f"  targets:       {tuple(target.shape)}   dtype={target.dtype}")
-    print(f"\n  past log_return  — mean: {past[:,:,0].mean():.5f}  std: {past[:,:,0].std():.5f}")
-    print(f"  target log_return — mean: {target.mean():.5f}  std: {target.std():.5f}")
+    print(f"\n  past log_ret (z-scored) — mean: {past[:,:,0].mean():.4f}  std: {past[:,:,0].std():.4f}")
+    print(f"  past RSI                — mean: {past[:,:,7].mean():.4f}  std: {past[:,:,7].std():.4f}")
+    print(f"  past nifty_log_ret      — mean: {past[:,:,10].mean():.4f}  std: {past[:,:,10].std():.4f}")
+    print(f"  target (z-scored)       — mean: {target.mean():.4f}        std: {target.std():.4f}")
     print(f"\nNaN in batch: {any(t.isnan().any().item() for t in [static, past, future, target])}")

@@ -10,7 +10,7 @@ Key components implemented from scratch:
 
 Input shapes (match src/data/dataset.py):
   static_covariates : (B, 32)
-  past_inputs       : (B, 60, 7)
+  past_inputs       : (B, 60, 11)   — 7 log-return features + RSI + MACD hist + ATR + Nifty50
   future_inputs     : (B,  5, 4)
 
 Output shape:
@@ -149,7 +149,7 @@ class TemporalFusionTransformer(nn.Module):
     def __init__(
         self,
         static_dim: int      = 32,
-        past_dim: int        = 7,
+        past_dim: int        = 11,
         past_seq_len: int    = 60,
         future_dim: int      = 4,
         num_future_steps: int = 5,
@@ -239,7 +239,7 @@ class TemporalFusionTransformer(nn.Module):
     def forward(
         self,
         static_covariates: torch.Tensor,   # (B, 32)
-        past_inputs: torch.Tensor,         # (B, 60, 7)
+        past_inputs: torch.Tensor,         # (B, 60, 10)
         future_inputs: torch.Tensor,       # (B,  5, 4)
     ) -> torch.Tensor:                     # (B,  5, num_quantiles)
 
@@ -309,7 +309,7 @@ if __name__ == "__main__":
 
     B = 4
     static = torch.randn(B, 32)
-    past   = torch.randn(B, 60, 7)
+    past   = torch.randn(B, 60, 11)
     future = torch.randn(B,  5, 4)
 
     with torch.no_grad():
