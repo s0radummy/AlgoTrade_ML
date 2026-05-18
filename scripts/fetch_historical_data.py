@@ -226,7 +226,7 @@ def fetch_and_save(
         print(f"  {symbol:<14} resuming from {actual_start} (last saved: {last})")
     else:
         actual_start = start_date
-        print(f"  {symbol:<14} fetching {actual_start} → {end_date}")
+        print(f"  {symbol:<14} fetching {actual_start} -> {end_date}")
 
     chunks = []
     cursor = actual_start
@@ -236,7 +236,7 @@ def fetch_and_save(
         if not chunk_df.empty:
             chunks.append(chunk_df)
         print(
-            f"    {cursor} → {chunk_end}  "
+            f"    {cursor} -> {chunk_end}  "
             f"({len(chunk_df)} candles){'  [empty]' if chunk_df.empty else ''}",
             flush=True,
         )
@@ -265,7 +265,7 @@ def fetch_and_save(
         new_df.to_parquet(path, index=False)
         written = len(new_df)
 
-    print(f"  {symbol:<14} +{written:,} new candles saved → {path}\n")
+    print(f"  {symbol:<14} +{written:,} new candles saved -> {path}\n")
     return written
 
 
@@ -295,7 +295,7 @@ def main():
     end_date   = date.today() - timedelta(days=1)  # up to yesterday
     start_date = end_date - timedelta(days=args.days)
 
-    print(f"Fetching {start_date} → {end_date}  ({args.days} days)\n")
+    print(f"Fetching {start_date} -> {end_date}  ({args.days} days)\n")
     print("=" * 60)
 
     total_candles = 0

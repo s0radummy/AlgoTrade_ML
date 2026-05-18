@@ -223,13 +223,24 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int,   default=512)
     args = parser.parse_args()
 
-    DIAG_SYMBOLS = ["RELIANCE", "INFY", "HDFCBANK"]  # Energy / IT / Finance — diverse
+    DIAG_SYMBOLS = [
+        "RELIANCE",   # Energy      — mega-cap
+        "HDFCBANK",   # Finance     — mega-cap
+        "INFY",       # IT          — large-cap
+        "ITC",        # Consumer    — large-cap
+        "TATASTEEL",  # Materials   — mid-cap
+        "APOLLOHOSP", # Healthcare  — mid-cap
+        "BEL",        # Industrials — small-cap
+        "BHARTIARTL", # Telecom     — large-cap
+        "MARUTI",     # Auto        — large-cap
+        "NTPC",       # Utilities   — large-cap
+    ]
     symbols    = DIAG_SYMBOLS if args.diagnostic else None
     batch_size = 256        if args.diagnostic else args.batch_size
     epochs     = 10         if args.diagnostic else args.epochs
 
     if args.diagnostic:
-        print("=== DIAGNOSTIC MODE: 3 stocks, 10 epochs ===")
+        print("=== DIAGNOSTIC MODE: 10 stocks, 10 epochs ===")
         print(f"Stocks: {DIAG_SYMBOLS}\n")
 
     print("Loading dataloaders...")
