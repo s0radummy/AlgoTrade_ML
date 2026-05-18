@@ -20,7 +20,7 @@ import os
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import redis as redis_lib
 from dotenv import load_dotenv
@@ -118,7 +118,7 @@ def redis_consumer_loop():
                     "Close":        str(ohlc.get("close", 0)),
                     "Volume":       str(tick.get("volume", 0)),
                     "Change":       str(tick.get("change", 0)),
-                    "Last_Updated": datetime.utcnow().isoformat(),
+                    "Last_Updated": datetime.now(timezone.utc).isoformat(),
                 }
 
                 try:
@@ -215,6 +215,12 @@ def influx_consumer_loop():
                 sym  = tick.get("symbol", "UNKNOWN")
                 ohlc = tick.get("ohlc", {})
 
+                ts_str = tick.get("timestamp")
+                tick_time = (
+                    datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
+                    if ts_str else datetime.now(timezone.utc)
+                )
+
                 point = (
                     Point("ticks")
                     .tag("symbol", sym)
@@ -226,6 +232,7 @@ def influx_consumer_loop():
                     .field("high",       float(ohlc.get("high", 0)))
                     .field("low",        float(ohlc.get("low", 0)))
                     .field("close",      float(ohlc.get("close", 0)))
+                    .time(tick_time)
                 )
                 batch.append(point)
 
@@ -312,7 +319,7 @@ def main():
         )
 
     print(f"\n{BOLD}Consumer Verification{RESET}")
-    print(f"  Kafka:   {BOOTSTRAP}  →  topic: {TOPIC}")
+    print(f"  Kafka:   {BOOTSTRAP}  ->  topic: {TOPIC}")
     print(f"  Redis:   {REDIS_HOST}:{REDIS_PORT}")
     print(f"  InfluxDB: {INFLUX_HOST}:{INFLUX_PORT}  bucket: {INFLUX_BUCKET}")
     print(f"  Offset:  earliest (picks up existing + new messages)")
