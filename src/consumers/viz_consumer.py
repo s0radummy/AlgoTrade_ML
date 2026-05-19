@@ -37,6 +37,7 @@ class VizConsumer:
                 value_deserializer=lambda m: json.loads(m.decode('utf-8')),
                 max_poll_records=100,
                 session_timeout_ms=30000,
+                consumer_timeout_ms=1000,  # allows running flag check every 1s
             )
             logger.info(f"Viz consumer initialized (group: {self.group_id})")
         except Exception as e:
@@ -45,7 +46,10 @@ class VizConsumer:
 
     def _register_signal_handlers(self):
         """Register signal handlers for graceful shutdown."""
-        signal.signal(signal.SIGTERM, self._shutdown_handler)
+        try:
+            signal.signal(signal.SIGTERM, self._shutdown_handler)
+        except (OSError, ValueError):
+            pass  # SIGTERM not available on Windows
         signal.signal(signal.SIGINT, self._shutdown_handler)
 
     def _shutdown_handler(self, signum, frame):
@@ -92,26 +96,28 @@ class VizConsumer:
         logger.info("Starting viz consumer...")
 
         try:
-            for message in self.consumer:
-                try:
-                    tick = message.value
+            while self.running:
+                # Inner for-loop exits naturally after consumer_timeout_ms (1s) with no messages,
+                # then the while-loop checks self.running to decide whether to continue or stop.
+                for message in self.consumer:
+                    if not self.running:
+                        break
+                    try:
+                        tick = message.value
 
-                    # Validate tick
-                    is_valid, error = tick_validator.validate_tick(tick)
-                    if not is_valid:
-                        logger.warning(f"Invalid tick: {error}")
-                        continue
+                        is_valid, error = tick_validator.validate_tick(tick)
+                        if not is_valid:
+                            logger.warning(f"Invalid tick: {error}")
+                            continue
 
-                    # Update state
-                    self.update_stock_state(tick)
+                        self.update_stock_state(tick)
 
-                    self.message_count += 1
-                    if self.message_count % 500 == 0:
-                        logger.info(f"Processed {self.message_count} ticks (Viz)")
+                        self.message_count += 1
+                        if self.message_count % 500 == 0:
+                            logger.info(f"Processed {self.message_count} ticks (Viz)")
 
-                except Exception as e:
-                    logger.error(f"Error processing message: {e}")
-                    continue
+                    except Exception as e:
+                        logger.error(f"Error processing message: {e}")
 
         except KafkaError as e:
             logger.error(f"Kafka error: {e}")
