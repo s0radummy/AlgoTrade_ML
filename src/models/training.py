@@ -35,7 +35,13 @@ class QuantileLoss(nn.Module):
             self.quantiles * errors,
             (self.quantiles - 1) * errors,
         )
-        return losses.mean()
+        pinball = losses.mean()
+
+        # Soft diversity penalty: push P90−P10 spread to stay above 0.05 z-score units.
+        # Weight 0.01 keeps this well below the primary pinball signal (~5% at collapse).
+        spread = predictions[..., -1] - predictions[..., 0]
+        spread_penalty = torch.relu(0.05 - spread).mean()
+        return pinball + 0.01 * spread_penalty
 
 
 class TFTTrainer:
@@ -52,7 +58,10 @@ class TFTTrainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
 
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
+        # AdamW (decoupled weight decay) instead of Adam+L2: prevents the adaptive
+        # amplification feedback loop where small output-head gradients cause
+        # effective L2 → large → weights → 0 → p50_std collapse.
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=1e-4)
         self.criterion = QuantileLoss(quantiles).to(self.device)
 
         # CosineAnnealingLR prevents the scheduler from being blind to epoch-1 collapse
@@ -81,8 +90,10 @@ class TFTTrainer:
             loss = self.criterion(predictions, targets)
             loss.backward()
 
-            # clip_grad_norm_ returns the pre-clip total norm
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            # clip_grad_norm_ returns the pre-clip total norm.
+            # 0.1 matches pytorch-forecasting reference; 1.0 is too high for attention
+            # architectures and can trigger attention entropy collapse.
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.1)
             self.optimizer.step()
 
             total_loss += loss.item()
@@ -136,6 +147,7 @@ class TFTTrainer:
         patience:     int = 10,
     ):
         """Train with early stopping, cosine LR, variance monitoring, and loss curve CSV."""
+        self._recent_p50: list[float] = []
         os.makedirs(os.path.dirname(settings.model_path), exist_ok=True)
 
         # Loss curve CSV — primary diagnostic: shows whether collapse happens at epoch 1
@@ -165,11 +177,24 @@ class TFTTrainer:
                 flush=True,
             )
 
-            # Collapse alarm: p50_std << 1 on z-scored targets means model predicts near-constant
+            # Collapse alarm 1: absolute threshold
             if p50_std < 1e-4:
                 print(
-                    "  WARNING: P50 prediction std collapsed — model predicts near-constant values! "
-                    "Check target standardization and learning rate.",
+                    "  WARNING: p50_std collapsed below 1e-4 — model predicts near-constant values!",
+                    flush=True,
+                )
+
+            # Collapse alarm 2: monotonic decline over 3+ consecutive epochs fires early,
+            # before the absolute threshold, saving hours of wasted training.
+            self._recent_p50.append(p50_std)
+            self._recent_p50 = self._recent_p50[-4:]
+            if len(self._recent_p50) >= 3 and all(
+                self._recent_p50[i] > self._recent_p50[i + 1]
+                for i in range(len(self._recent_p50) - 1)
+            ):
+                print(
+                    "  WARNING: p50_std declining for 3+ consecutive epochs — "
+                    "collapse in progress. Consider killing this run.",
                     flush=True,
                 )
 
@@ -194,6 +219,7 @@ class TFTTrainer:
                         "model_state_dict":     self.model.state_dict(),
                         "optimizer_state_dict": self.optimizer.state_dict(),
                         "val_loss":             val_loss,
+                        "p50_std":              p50_std,
                         "target_stats":         self.target_stats,
                     },
                     settings.model_path,
@@ -216,11 +242,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train TFT model on Nifty 50 historical data.")
     parser.add_argument(
         "--diagnostic", action="store_true",
-        help="Quick 3-stock test (RELIANCE, INFY, HDFCBANK) to verify the model learns.",
+        help="Quick 10-stock test to verify the model learns before committing to a full run.",
     )
-    parser.add_argument("--epochs",     type=int,   default=25)
-    parser.add_argument("--lr",         type=float, default=3e-4)
-    parser.add_argument("--batch_size", type=int,   default=512)
+    parser.add_argument("--epochs",        type=int,   default=25)
+    parser.add_argument("--lr",            type=float, default=3e-4)
+    parser.add_argument("--batch_size",    type=int,   default=512)
+    parser.add_argument(
+        "--no-warmstart", action="store_true",
+        help="Ignore any existing checkpoint and train from scratch.",
+    )
     args = parser.parse_args()
 
     DIAG_SYMBOLS = [
@@ -254,21 +284,34 @@ if __name__ == "__main__":
     model = TemporalFusionTransformer()
 
     # Warm-start from existing checkpoint when available.
-    # A RuntimeError here means the checkpoint was built with a different past_dim
-    # (e.g., old 7-feature checkpoint vs new 10-feature model) — train from scratch.
-    if os.path.exists(settings.model_path):
+    # Skipped if --no-warmstart is set or if the checkpoint has collapsed predictions
+    # (p50_std < 1e-3 means the saved weights are useless for inference).
+    if os.path.exists(settings.model_path) and not args.no_warmstart:
         try:
             ckpt = torch.load(settings.model_path, map_location="cpu", weights_only=False)
-            model.load_state_dict(ckpt["model_state_dict"])
-            print(f"Loaded weights from {settings.model_path} "
-                  f"(epoch {ckpt['epoch']}, val={ckpt['val_loss']:.6f})")
+            saved_p50_std = ckpt.get("p50_std", 1.0)
+            if saved_p50_std < 1e-3:
+                print(
+                    f"Checkpoint has collapsed predictions (p50_std={saved_p50_std:.6f}) "
+                    f"— skipping warm-start, training from scratch."
+                )
+            else:
+                model.load_state_dict(ckpt["model_state_dict"])
+                print(
+                    f"Loaded weights from {settings.model_path} "
+                    f"(epoch {ckpt['epoch']}, val={ckpt['val_loss']:.6f}, "
+                    f"p50_std={saved_p50_std:.6f})"
+                )
         except RuntimeError as e:
             print(
                 f"Checkpoint incompatible (likely past_dim mismatch after feature expansion) "
                 f"— training from scratch.\n  {e}"
             )
     else:
-        print("No checkpoint found — training from scratch.")
+        if args.no_warmstart:
+            print("--no-warmstart set — training from scratch.")
+        else:
+            print("No checkpoint found — training from scratch.")
 
     # Collect per-stock target normalization stats so inference can denormalize predictions
     target_stats = {
@@ -279,4 +322,4 @@ if __name__ == "__main__":
 
     trainer = TFTTrainer(model, learning_rate=args.lr, max_epochs=epochs)
     trainer.target_stats = target_stats
-    trainer.fit(train_loader, val_loader, epochs=epochs, patience=5)
+    trainer.fit(train_loader, val_loader, epochs=epochs, patience=15)
