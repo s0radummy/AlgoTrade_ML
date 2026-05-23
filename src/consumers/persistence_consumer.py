@@ -126,11 +126,17 @@ class PersistenceConsumer:
                 f"Flushed {len(self.batch)} ticks to InfluxDB "
                 f"(total: {self.write_count})"
             )
+            # Commit offsets after successful write — at-least-once delivery
+            if self.consumer:
+                try:
+                    self.consumer.commit()
+                except Exception as commit_err:
+                    logger.error(f"Offset commit failed after write: {commit_err}")
             self.batch = []
 
         except Exception as e:
             logger.error(f"Error writing to InfluxDB: {e}")
-            # Don't clear batch on error; retry on next flush
+            # Don't clear batch or commit on error; retry on next flush
 
     def consume(self):
         """Main consumption loop."""

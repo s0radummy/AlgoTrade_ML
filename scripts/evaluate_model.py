@@ -290,12 +290,15 @@ def _build_window_dataset(data_dir: str, days_back_start: int, days_back_end: in
     Returns a TFTDataset covering exactly the window
     [series_end - days_back_start, series_end - days_back_end].
     Uses TFTDataset.val_start_days to bound the window on both sides.
+
+    TFTDataset split logic: win_end >= (series_end - val_days) AND win_end < (series_end - val_start_days)
+    So val_days must be the OLDER (larger) boundary and val_start_days the NEWER (smaller) boundary.
     """
     return TFTDataset(
         data_dir=data_dir,
         split="val",
-        val_days=days_back_end,
-        val_start_days=days_back_start,
+        val_days=days_back_start,      # older boundary — more days back from series end
+        val_start_days=days_back_end,  # newer boundary — fewer days back from series end
     )
 
 

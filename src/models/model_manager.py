@@ -19,9 +19,12 @@ class ModelManager:
         self.model_metadata = {}
         self.model_version = "v1"
         self.cache_ttl = settings.model_cache_ttl
+        self._model_loaded = False
 
-        # Try to load model
-        self.load_model()
+    def _ensure_model_loaded(self):
+        if not self._model_loaded:
+            self.load_model()
+            self._model_loaded = True
 
     def load_model(self) -> bool:
         """Load TFT model from checkpoint."""
@@ -75,6 +78,7 @@ class ModelManager:
         future_inputs: torch.Tensor,
     ) -> torch.Tensor:
         """Get predictions from model."""
+        self._ensure_model_loaded()
         try:
             with torch.no_grad():
                 static_covariates, past_inputs, future_inputs = self.preprocess_inputs(
@@ -124,6 +128,7 @@ class ModelManager:
 
     def save_checkpoint(self, path: str, metadata: Optional[Dict] = None) -> bool:
         """Save model checkpoint."""
+        self._ensure_model_loaded()
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -145,6 +150,7 @@ class ModelManager:
 
     def get_model_info(self) -> Dict:
         """Get model information."""
+        self._ensure_model_loaded()
         return {
             "version": self.model_version,
             "device": str(self.device),

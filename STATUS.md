@@ -1,6 +1,6 @@
 # AlgoTrading — Status
 
-_Last updated: 2026-05-21_
+_Last updated: 2026-05-23 (session 2)_
 
 **Project:** Real-time stock price prediction system for Nifty 50. Live market ticks stream via KiteConnect WebSocket → Kafka → three consumers: a Temporal Fusion Transformer (TFT) inference engine that predicts 5-minute-ahead log-return quantiles, a Redis state aggregator for the UI, and an InfluxDB persistence layer. Deployed on a single machine via Docker Compose.
 
@@ -19,13 +19,13 @@ _Last updated: 2026-05-21_
 | 7 | TFT Architecture | Full paper impl, correct I/O shapes | ✅ Done — 462K params, output `(B,5,5)` verified |
 | 8 | Dataset Loader | Sliding window with all 11 features, train/val split | ✅ Done — gap detection, z-scoring, walk-forward support |
 | 9 | TFT Training | 47-stock model with improving val loss | ✅ Done — full run complete, best val=0.213697, p50_std peaked 0.095, checkpoint safe for inference |
-| 10 | Inference Consumer | 1-min bar accumulator matching training features exactly | ✅ Written — untested live (needs trained model) |
+| 10 | Inference Consumer | 1-min bar accumulator matching training features exactly | ✅ Written — lazy-init fix applied; ready to test live |
 | 11 | Viz Consumer | Kafka → Redis pub/sub state | ✅ Fixed — clean shutdown loop, Windows-safe signals; ready to test live |
-| 12 | Persistence Consumer | Kafka → InfluxDB batch writes | ✅ Written — untested (missing offset commit) |
-| 13 | Model Manager | Load TFT weights, serve predictions, Redis cache | ✅ Written — untested (singleton blocker) |
+| 12 | Persistence Consumer | Kafka → InfluxDB batch writes | ✅ Fixed — offset commit added; ready to test live |
+| 13 | Model Manager | Load TFT weights, serve predictions, Redis cache | ✅ Fixed — lazy init applied; ready to test live |
 | 14 | FastAPI | `/predict`, `/health`, `/history` endpoints | ✅ Written — untested (`/history` stub incomplete) |
-| 15 | Docker Compose | Full pipeline orchestrated, all services healthy | ⚠️ Partial — Dockerfiles for producer/consumer missing |
-| 16 | Walk-forward Eval | Consistent directional accuracy >50% across regimes | ⏳ Pending — needs trained model |
+| 15 | Docker Compose | Full pipeline orchestrated, all services healthy | ⚠️ Partial — Kafka partitions fixed (25); Dockerfiles for producer/consumer still unverified |
+| 16 | Walk-forward Eval | Consistent directional accuracy >50% across regimes | ✅ Done — 52.65% mean dir. accuracy, std 0.37%, range 52.18–53.18% across 6 windows |
 | 17 | Live Inference Test | `PRED:*:quantiles` in Redis within 60min of market open | ⏳ Pending — needs trained model + market hours |
 | 18 | Streamlit Dashboard | Hybrid heatmap+table UI with candlestick drill-down | ✅ Done — research-backed redesign, 3-tab layout |
 
@@ -86,28 +86,69 @@ Full Run 4 best val was epoch 4 (0.213697). Val loss then oscillated in a 0.0003
 
 ## Known Issues
 
-- **Module-load singletons** — `redis_client` and `kafka_producer` are now lazy (fixed). `model_manager` and `instrument_loader` still eagerly connect on import — needs lazy init before running inference consumer standalone.
-- **Missing offset commit** — `persistence_consumer.py` never calls `consumer.commit()`, messages re-process on restart.
-- **Kafka partition count** — fresh Docker start auto-creates `stock-quotes` with 1 partition; must be manually set to 25.
-- **3 missing stocks** — LTIM, TATAMOTORS, ZOMATO not fetched (47/50 present).
-- **`instrument_loader.py`** — hardcodes 6 stocks; needs full KiteConnect instrument API.
+- **3 missing stocks** — LTIM, TATAMOTORS, ZOMATO have no historical parquet data and are excluded from the checkpoint's `target_stats`. Do not add them to `settings.stocks` until data is fetched and the model is retrained.
+- **`/history` endpoint stub** — `src/api/app.py` has the endpoint wired but InfluxDB query is incomplete; returns placeholder data.
+- **Docker Compose Dockerfiles** — `docker/Dockerfile.producer` and `docker/Dockerfile.consumer` exist but have not been tested in a full `docker-compose up` run end-to-end.
+- **`instrument_loader` tokens** — all instrument tokens are set to `0` (placeholder). Real tokens must come from KiteConnect instruments API; the inference consumer uses the raw token from the tick payload so this does not block live inference.
+
+### Fixed (2026-05-23)
+
+- ~~Module-load singletons~~ — `model_manager` and `instrument_loader` now use lazy init; importing either file no longer connects to Redis or loads PyTorch.
+- ~~Missing offset commit~~ — `persistence_consumer.py` now calls `consumer.commit()` after each successful InfluxDB write.
+- ~~Kafka partition count~~ — `docker-compose.yml` now sets `KAFKA_CREATE_TOPICS: "stock-quotes:25:1"`; topic is created with 25 partitions at broker startup. ⚠️ Run `docker-compose down -v` if you have an existing volume with 1 partition.
+- ~~`instrument_loader.py` hardcodes 6 stocks~~ — now derives all 47 stocks from `STOCK_META` via `settings.stock_list`.
+- ~~`settings.py` hardcodes 6 stocks~~ — default expanded to all 47 trained stocks.
+- ~~Walk-forward eval bug~~ — `_build_window_dataset` in `evaluate_model.py` had `val_days`/`val_start_days` swapped, returning 0 windows. Fixed.
+- ~~`.env` stock list wrong~~ — had 50 stocks including 4 not in the trained model (BPCL, SHREECEM, TATAMOTORS, UPL) and missing BEL. Corrected to exactly the 47 trained stocks.
+- ~~`kite_to_kafka.py` fallback~~ — default stock list was 3 stocks hardcoded. Updated fallback to all 47 trained stocks.
+- ~~`.env.example` stock list~~ — updated from old 6-stock placeholder to all 47 trained stocks.
 
 ---
 
+## Pre-flight Checklist (complete before next market session)
+
+| # | Item | Status |
+|---|------|--------|
+| ✅ | Walk-forward eval passed (52.65% mean dir. accuracy, std 0.37%) | Done |
+| ✅ | `.env` STOCKS corrected to 47 trained stocks (removed BPCL, SHREECEM, TATAMOTORS, UPL; added BEL) | Done |
+| ✅ | `kite_to_kafka.py` fallback updated to 47 stocks | Done |
+| ✅ | All code bugs fixed (singletons, offset commit, Kafka partitions, eval script) | Done |
+| ⬜ | KiteConnect credentials confirmed in `.env` (API key, secret, user ID, password, **TOTP base32 secret**) | Manual — must verify before live run |
+| ⬜ | `docker-compose down -v` run once to clear old Kafka volume | One-time — do before first `docker-compose up` |
+| ⬜ | `pip install -r requirements.txt` confirmed up to date | Run once to confirm |
+
+> **TOTP note:** `KITE_TWO_FA` must be the base32 *secret* from your authenticator app setup (long string like `JBSWY3DPEHPK3PXP`), not the rotating 6-digit code. `kite_to_kafka.py` uses `pyotp` to generate the code automatically.
+
 ## Next Steps
 
-1. **Walk-forward eval** — `py scripts/evaluate_model.py --walk_forward 6`
-   _Done when: directional accuracy >50% consistently across all 6 windows (not just one lucky period)._
+1. **Live inference test** _(market hours — Phase 2)_
 
-2. **Fix inference consumer singletons** — `model_manager` and `instrument_loader` eagerly connect on import; needs lazy init before running inference consumer standalone.
-   _Done when: `py -m src.consumers.inference_consumer` starts without errors outside Docker._
+   ```
+   docker-compose up -d zookeeper kafka redis
+   py scripts/kite_to_kafka.py             # terminal 1 — real producer (NOT scripts/producer.py)
+   py -m src.consumers.inference_consumer  # terminal 2
+   # wait ~60 min after 9:15 AM IST, then:
+   redis-cli HGETALL PRED:RELIANCE:quantiles
+   ```
+   _Done when: `PRED:<SYMBOL>:quantiles` keys exist in Redis for most stocks, P50 is non-zero and changing each minute._
 
-3. **Live inference test** — run KiteConnect producer + inference consumer together during market hours
-   _Done when: `PRED:<SYMBOL>:quantiles` keys appear in Redis for all 47 stocks within 60 minutes of market open (60-bar warmup required)._
+2. **Full live test + dashboard** _(market hours — Phase 3)_
 
-4. **Test viz consumer live** — run producer + viz_consumer together, then `streamlit run scripts/dashboard.py`
-   _Done when: dashboard shows live LTP/OHLCV for all 47+ stocks updating every tick._
+   ```
+   docker-compose up -d zookeeper kafka redis influxdb
+   py scripts/kite_to_kafka.py                     # terminal 1
+   py -m src.consumers.inference_consumer          # terminal 2
+   py -m src.consumers.viz_consumer                # terminal 3
+   py -m src.consumers.persistence_consumer        # terminal 4
+   streamlit run scripts/dashboard.py              # terminal 5
+   ```
+   _Done when: dashboard shows live prices + TFT predictions for all 47 stocks updating each tick._
 
-5. **Fix missing offset commit** in `persistence_consumer.py` — messages re-process on restart.
+3. **Docker Compose end-to-end** _(anytime — Phase 4)_
 
-6. **Docker Compose** — add missing Dockerfiles for producer and consumers.
+   ```
+   docker-compose down -v    # clears old Kafka volume — one-time
+   docker-compose up -d
+   docker-compose ps         # all 8 services should show healthy
+   ```
+   _Done when: single command brings everything up. Note: Dockerfiles untested end-to-end — may need minor path/dependency fixes._

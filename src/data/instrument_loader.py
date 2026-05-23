@@ -3,6 +3,7 @@ from typing import Dict, Optional, List
 from config.settings import settings
 from src.utils.logger import setup_logger
 from src.core.redis_client import redis_client
+from src.data.dataset import STOCK_META
 
 logger = setup_logger(__name__)
 
@@ -11,59 +12,31 @@ class InstrumentLoader:
 
     def __init__(self):
         self.cache = {}
-        self.load_default_instruments()
+        self._loaded = False
+
+    def _ensure_loaded(self):
+        if not self._loaded:
+            self.load_default_instruments()
+            self._loaded = True
 
     def load_default_instruments(self):
-        """Load default instrument metadata."""
-        # This is a placeholder - in production, this would come from KiteConnect API
-        default_instruments = {
-            "RELIANCE": {
-                "symbol": "RELIANCE",
-                "token": 738561,
-                "sector": "Energy",
-                "market_cap": 15000000000000,  # 15T INR
-                "lot_size": 1
-            },
-            "INFY": {
-                "symbol": "INFY",
-                "token": 1346649,
-                "sector": "IT",
-                "market_cap": 8500000000000,  # 8.5T INR
-                "lot_size": 1
-            },
-            "TCS": {
-                "symbol": "TCS",
-                "token": 1314561,
-                "sector": "IT",
-                "market_cap": 13200000000000,  # 13.2T INR
-                "lot_size": 1
-            },
-            "WIPRO": {
-                "symbol": "WIPRO",
-                "token": 1769169,
-                "sector": "IT",
-                "market_cap": 3200000000000,  # 3.2T INR
-                "lot_size": 1
-            },
-            "LT": {
-                "symbol": "LT",
-                "token": 1064961,
-                "sector": "Industrials",
-                "market_cap": 2800000000000,  # 2.8T INR
-                "lot_size": 1
-            },
-            "ASIANPAINT": {
-                "symbol": "ASIANPAINT",
-                "token": 855169,
-                "sector": "Consumer",
-                "market_cap": 2400000000000,  # 2.4T INR
-                "lot_size": 1
+        """Load instrument metadata from STOCK_META for all tracked stocks."""
+        new_instruments = {}
+        for symbol in settings.stock_list:
+            if symbol not in STOCK_META:
+                logger.warning(f"Symbol {symbol} not in STOCK_META — skipping")
+                continue
+            sector, market_cap = STOCK_META[symbol]
+            new_instruments[symbol] = {
+                "symbol": symbol,
+                "token": 0,  # placeholder — real token from KiteConnect API
+                "sector": sector,
+                "market_cap": market_cap,
+                "lot_size": 1,
             }
-        }
-
-        self.cache = default_instruments
+        self.cache = new_instruments
         self._cache_to_redis()
-        logger.info(f"Loaded {len(self.cache)} default instruments")
+        logger.info(f"Loaded {len(self.cache)} instruments from STOCK_META")
 
     def _cache_to_redis(self):
         """Cache instruments to Redis (best-effort — Redis may not be up yet)."""
@@ -79,6 +52,7 @@ class InstrumentLoader:
 
     def get_instrument(self, symbol: str) -> Optional[Dict]:
         """Get instrument metadata by symbol."""
+        self._ensure_loaded()
         if symbol not in self.cache:
             # Try to load from Redis
             cached = redis_client.get(f"INSTRUMENT:{symbol}")
@@ -91,21 +65,17 @@ class InstrumentLoader:
 
     def get_all_instruments(self) -> Dict:
         """Get all cached instruments."""
+        self._ensure_loaded()
         return self.cache
 
     def get_sector_embedding(self, sector: str) -> int:
         """Get sector embedding index (for TFT model)."""
         sector_map = {
-            "IT": 0,
-            "Energy": 1,
-            "Industrials": 2,
-            "Consumer": 3,
-            "Finance": 4,
-            "Healthcare": 5,
-            "Utilities": 6,
-            "Telecom": 7,
+            "IT": 0, "Finance": 1, "Energy": 2, "Auto": 3,
+            "Consumer": 4, "Healthcare": 5, "Industrials": 6,
+            "Materials": 7, "Telecom": 8, "Utilities": 9,
         }
-        return sector_map.get(sector, 8)  # 8 for unknown
+        return sector_map.get(sector, 10)  # 10 for unknown
 
     def normalize_market_cap(self, market_cap: float) -> float:
         """Normalize market cap to [-1, 1] range."""
