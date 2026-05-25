@@ -45,7 +45,7 @@ class Settings(BaseSettings):
 
     # Model
     model_path: str = "models/tft_v1.pth"
-    model_cache_ttl: int = 2
+    model_cache_ttl: int = 120
 
     # Stocks
     stocks: str = (

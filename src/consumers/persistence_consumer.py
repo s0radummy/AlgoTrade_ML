@@ -2,7 +2,7 @@ import json
 import signal
 from kafka import KafkaConsumer
 from kafka.errors import KafkaError
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List
 from influxdb_client import InfluxDBClient
 from influxdb_client.client.write_api import SYNCHRONOUS
@@ -83,8 +83,13 @@ class PersistenceConsumer:
             symbol = tick.get("symbol", "UNKNOWN")
             timestamp = tick.get("timestamp", datetime.utcnow().isoformat())
 
-            # Convert ISO timestamp to epoch nanoseconds
+            # Convert ISO timestamp to epoch nanoseconds.
+            # fromisoformat on a no-suffix string returns a naive datetime;
+            # .timestamp() on naive uses local time (IST on this machine), shifting
+            # the stored epoch by -5:30h. Explicitly attach UTC before converting.
             dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
             timestamp_ns = int(dt.timestamp() * 1e9)
 
             # InfluxDB line protocol: measurement,tags fields timestamp

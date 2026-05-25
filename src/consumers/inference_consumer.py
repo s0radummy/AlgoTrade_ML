@@ -2,6 +2,7 @@ import json
 import os
 import signal
 import torch
+import pandas as pd
 from collections import deque
 from kafka import KafkaConsumer
 from kafka.errors import KafkaError
@@ -52,8 +53,11 @@ class BarAccumulator:
         ts_ms = tick.get("exchange_timestamp") or tick.get("timestamp", 0)
         if ts_ms:
             try:
-                ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-            except (OSError, OverflowError):
+                if isinstance(ts_ms, str):
+                    ts = datetime.fromisoformat(ts_ms).replace(tzinfo=timezone.utc)
+                else:
+                    ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+            except (OSError, OverflowError, ValueError):
                 ts = datetime.now(tz=timezone.utc)
         else:
             ts = datetime.now(tz=timezone.utc)
@@ -136,6 +140,7 @@ class InferenceConsumer:
         self.initialize_consumer()
         self._load_target_stats()
         self._register_signal_handlers()
+        self.warm_bars: Dict[str, List[Dict]] = self._warm_start_from_parquet()
 
     def initialize_consumer(self):
         try:
@@ -220,10 +225,12 @@ class InferenceConsumer:
         try:
             acc = self.accumulators.get(instrument_token)
             if acc is None or not acc.ready():
+                logger.debug(f"[{symbol}] construct: acc not ready (completed={len(acc.completed) if acc else 'None'})")
                 return None
 
             bars = acc.get_bars()
             if len(bars) < MIN_BARS + 1:
+                logger.debug(f"[{symbol}] construct: not enough bars ({len(bars)} < {MIN_BARS + 1})")
                 return None
 
             # Use the last MIN_BARS+1 bars so we have prev_close for bar[0]
@@ -336,17 +343,63 @@ class InferenceConsumer:
                 "timestamp": datetime.now(tz=timezone.utc).isoformat(),
             }
 
+            logger.debug(f"[{symbol}] Writing prediction P50={quantiles_dict['P50']:.6f} to Redis (ttl={settings.model_cache_ttl}s)")
             model_manager.cache_prediction(
                 symbol,
                 quantiles_dict,
                 ttl=settings.model_cache_ttl,
             )
-
-            logger.debug(f"Cached predictions for {symbol} (P50: {quantiles_dict['P50']:.6f})")
+            logger.debug(f"[{symbol}] Prediction cached OK")
 
         except Exception as e:
             logger.error(f"Inference error for {symbol}: {e}")
             model_manager.circuit_breaker_fallback(symbol)
+
+    def _warm_start_from_parquet(self) -> Dict[str, List[Dict]]:
+        """Pre-load last MIN_BARS+5 bars per stock from parquet so inference starts immediately."""
+        parquet_dir = "data/historical"
+        warm_bars: Dict[str, List[Dict]] = {}
+
+        def _parquet_to_bars(path: str) -> List[Dict]:
+            df = pd.read_parquet(path, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df = df.tail(MIN_BARS + 5)
+            bars = []
+            for _, row in df.iterrows():
+                ts = pd.to_datetime(row["timestamp"])
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("UTC")
+                bars.append({
+                    "open":   float(row["open"]),
+                    "high":   float(row["high"]),
+                    "low":    float(row["low"]),
+                    "close":  float(row["close"]),
+                    "volume": float(row["volume"]),
+                    "ts":     ts.to_pydatetime(),
+                })
+            return bars
+
+        # Per-stock warm-start
+        for symbol in settings.stock_list:
+            path = os.path.join(parquet_dir, f"{symbol}.parquet")
+            if not os.path.exists(path):
+                continue
+            try:
+                warm_bars[symbol] = _parquet_to_bars(path)
+            except Exception as e:
+                logger.warning(f"Could not warm-start {symbol} from parquet: {e}")
+
+        # Nifty50 index warm-start
+        nifty_path = os.path.join(parquet_dir, "NIFTY50.parquet")
+        if os.path.exists(nifty_path):
+            try:
+                for bar in _parquet_to_bars(nifty_path):
+                    self.nifty_acc.completed.append(bar)
+                logger.info(f"Nifty50 warm-started with {len(self.nifty_acc.completed)} bars")
+            except Exception as e:
+                logger.warning(f"Could not warm-start Nifty50 from parquet: {e}")
+
+        logger.info(f"Parquet warm-start complete: {len(warm_bars)}/{len(settings.stock_list)} stocks ready")
+        return warm_bars
 
     def consume(self):
         self.running = True
@@ -372,9 +425,17 @@ class InferenceConsumer:
 
                     # Per-stock bar accumulation
                     if instrument_token not in self.accumulators:
-                        self.accumulators[instrument_token] = BarAccumulator(maxlen=MIN_BARS)
+                        acc = BarAccumulator(maxlen=MIN_BARS)
+                        if symbol in self.warm_bars:
+                            for bar in self.warm_bars.pop(symbol):
+                                acc.completed.append(bar)
+                            logger.info(f"Warm-started {symbol} with {len(acc.completed)} historical bars")
+                        self.accumulators[instrument_token] = acc
 
                     bar_completed = self.accumulators[instrument_token].update(tick)
+
+                    if bar_completed:
+                        logger.debug(f"Bar completed for {symbol} (ready={self.accumulators[instrument_token].ready()})")
 
                     # Run inference whenever a bar is completed and we have enough history
                     if bar_completed and self.accumulators[instrument_token].ready():
