@@ -6,7 +6,7 @@ import pandas as pd
 from collections import deque
 from kafka import KafkaConsumer
 from kafka.errors import KafkaError
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 
