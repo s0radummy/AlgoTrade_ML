@@ -53,13 +53,18 @@ def load_checkpoint(model_path: str):
 
 # ── InfluxDB data fetch ───────────────────────────────────────────────────────
 
-def fetch_bars(symbol: str, start_utc: str, stop_utc: str) -> pd.DataFrame:
+def fetch_bars(symbol: str, date) -> pd.DataFrame:
     """
-    Query InfluxDB for tick-level last_price + volume, aggregate into 1-min
-    OHLCV bars. Applies +5:30h correction for the naive-datetime timestamp bug.
+    Query InfluxDB for a full session's tick data for one symbol, aggregate
+    into 1-min OHLCV bars, and return bars for the 9:15–15:30 IST window.
+
+    Handles two timestamp storage regimes automatically:
+      Correct UTC (2026-05-27+): session 03:45–10:00 UTC stored as-is.
+      Bugged  UTC (2026-05-26):  same ticks stored at UTC-5:30 (02:15–04:30 UTC).
+    Tries the correct window first; falls back to the bugged window if empty.
 
     Returns DataFrame with columns [open, high, low, close, volume] indexed
-    by actual UTC timestamps. Empty DataFrame on failure.
+    by true UTC timestamps. Empty DataFrame if no data found.
     """
     from influxdb_client import InfluxDBClient
 
@@ -69,7 +74,16 @@ def fetch_bars(symbol: str, start_utc: str, stop_utc: str) -> pd.DataFrame:
         token=settings.influxdb_token,
     )
 
-    query = f'''
+    # Correct UTC  (2026-05-27+): full session 03:30–10:05 UTC
+    # Bugged  UTC  (2026-05-26):  same session stored at -5:30h → 22:00 prev–04:35 UTC
+    prev = date - timedelta(days=1)
+    windows = [
+        (f"{date.isoformat()}T03:30:00Z",  f"{date.isoformat()}T10:05:00Z",  False),
+        (f"{prev.isoformat()}T22:00:00Z",  f"{date.isoformat()}T04:35:00Z",  True),
+    ]
+
+    def _query_window(start_utc: str, stop_utc: str, apply_correction: bool) -> pd.DataFrame:
+        query = f'''
 from(bucket: "{settings.influxdb_bucket}")
   |> range(start: {start_utc}, stop: {stop_utc})
   |> filter(fn: (r) => r["_measurement"] == "ticks" and r["symbol"] == "{symbol}")
@@ -77,42 +91,55 @@ from(bucket: "{settings.influxdb_bucket}")
   |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
   |> sort(columns: ["_time"])
 '''
+        try:
+            result = client.query_api().query_data_frame(query)
+        except Exception as e:
+            print(f"  [{symbol}] InfluxDB error: {e}")
+            return pd.DataFrame()
+
+        if result is None or (isinstance(result, list) and all(r.empty for r in result)):
+            return pd.DataFrame()
+        if isinstance(result, list):
+            result = pd.concat(result, ignore_index=True)
+        if result.empty or "_time" not in result.columns:
+            return pd.DataFrame()
+        if "last_price" not in result.columns or "volume" not in result.columns:
+            return pd.DataFrame()
+
+        times = pd.to_datetime(result["_time"], utc=True)
+        if apply_correction:
+            times = times + IST_OFFSET          # undo the -5:30h storage bug → true UTC
+        result["_time"] = times
+        result = result.set_index("_time").sort_index()
+
+        lp  = result["last_price"].dropna()
+        vol = result["volume"].dropna()
+
+        bars = pd.DataFrame({
+            "open":    lp.resample("1min").first(),
+            "high":    lp.resample("1min").max(),
+            "low":     lp.resample("1min").min(),
+            "close":   lp.resample("1min").last(),
+            "vol_max": vol.resample("1min").max(),
+            "vol_min": vol.resample("1min").min(),
+        })
+        bars["volume"] = (bars["vol_max"] - bars["vol_min"]).clip(lower=0)
+        bars = bars[["open", "high", "low", "close", "volume"]].dropna(subset=["open", "close"])
+
+        # Filter to IST market hours 9:15–15:30 (index is true UTC after correction)
+        ist_idx = bars.index + IST_OFFSET
+        ist_min = ist_idx.hour * 60 + ist_idx.minute
+        bars    = bars[(ist_min >= 9 * 60 + 15) & (ist_min <= 15 * 60 + 30)]
+        return bars
+
     try:
-        result = client.query_api().query_data_frame(query)
-    except Exception as e:
-        print(f"  [{symbol}] InfluxDB error: {e}")
-        client.close()
+        for start_utc, stop_utc, apply_correction in windows:
+            bars = _query_window(start_utc, stop_utc, apply_correction)
+            if not bars.empty and len(bars) >= 10:
+                return bars
         return pd.DataFrame()
     finally:
         client.close()
-
-    if result is None or (isinstance(result, list) and all(r.empty for r in result)):
-        return pd.DataFrame()
-    if isinstance(result, list):
-        result = pd.concat(result, ignore_index=True)
-    if result.empty or "_time" not in result.columns:
-        return pd.DataFrame()
-    if "last_price" not in result.columns or "volume" not in result.columns:
-        return pd.DataFrame()
-
-    # Apply +5:30h to correct -5:30h storage offset
-    result["_time"] = pd.to_datetime(result["_time"], utc=True) + IST_OFFSET
-    result = result.set_index("_time").sort_index()
-
-    lp  = result["last_price"].dropna()
-    vol = result["volume"].dropna()
-
-    bars = pd.DataFrame({
-        "open":    lp.resample("1min").first(),
-        "high":    lp.resample("1min").max(),
-        "low":     lp.resample("1min").min(),
-        "close":   lp.resample("1min").last(),
-        "vol_max": vol.resample("1min").max(),
-        "vol_min": vol.resample("1min").min(),
-    })
-    bars["volume"] = (bars["vol_max"] - bars["vol_min"]).clip(lower=0)
-    bars = bars[["open", "high", "low", "close", "volume"]].dropna(subset=["open", "close"])
-    return bars
 
 
 # ── Feature construction ──────────────────────────────────────────────────────
@@ -259,23 +286,17 @@ def evaluate_stock(
 
 def main():
     parser = argparse.ArgumentParser(description="Overnight TFT evaluation on live InfluxDB session data")
-    parser.add_argument("--date",   default="2026-05-25",
+    parser.add_argument("--date",   default="2026-05-26",
                         help="Session date in IST, YYYY-MM-DD (default: today)")
-    parser.add_argument("--output", default="results/live_eval_2026-05-25.csv")
+    parser.add_argument("--output", default="results/live_eval_2026-05-26.csv")
     parser.add_argument("--model",  default=settings.model_path)
     args = parser.parse_args()
 
-    # InfluxDB query window accounting for -5:30h timestamp storage bug:
-    # True session 10:00–15:30 IST = 04:30–10:00 UTC. After bug: stored as
-    # 23:00 prev-day–04:30 UTC. Use a wide window to capture everything.
     date = datetime.strptime(args.date, "%Y-%m-%d").date()
-    prev = date - timedelta(days=1)
-    start_utc = f"{prev.isoformat()}T22:30:00Z"
-    stop_utc  = f"{date.isoformat()}T05:00:00Z"
 
     print(f"\nOvernight TFT Evaluation — {args.date}")
-    print(f"  InfluxDB window (stored UTC): {start_utc}  to  {stop_utc}")
-    print(f"  (+5:30h correction applied to timestamps before bar construction)")
+    print(f"  Tries correct-UTC window first ({date}T03:30Z→10:05Z),")
+    print(f"  falls back to bugged-UTC window (prev-dayT22:00Z→{date}T04:35Z + +5:30h).")
     print(f"  Model:  {args.model}")
     print(f"  Output: {args.output}\n")
 
@@ -296,7 +317,7 @@ def main():
     stock_summaries = []
 
     for symbol in stocks:
-        bars = fetch_bars(symbol, start_utc, stop_utc)
+        bars = fetch_bars(symbol, date)
 
         if bars.empty or len(bars) < MIN_BARS + 2:
             print(f"  [{symbol:12s}]  SKIP — {len(bars)} bars (need ≥{MIN_BARS + 2})")
