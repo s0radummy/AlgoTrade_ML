@@ -132,7 +132,7 @@ class InferenceConsumer:
         self.accumulators: Dict[str, BarAccumulator] = {}
 
         # Shared Nifty50 bar accumulator (instrument_token == NIFTY50_TOKEN)
-        self.nifty_acc = BarAccumulator(maxlen=MIN_BARS)
+        self.nifty_acc = BarAccumulator(maxlen=MIN_BARS + 40)
 
         self.message_count = 0
         self.target_stats: dict = {}
@@ -140,7 +140,7 @@ class InferenceConsumer:
         self.initialize_consumer()
         self._load_target_stats()
         self._register_signal_handlers()
-        self.warm_bars: Dict[str, List[Dict]] = self._warm_start_from_parquet()
+        self.warm_bars: Dict[str, List[Dict]] = self._warm_start_from_influxdb()
 
     def initialize_consumer(self):
         try:
@@ -241,14 +241,19 @@ class InferenceConsumer:
 
             # Take the last MIN_BARS rows (drop the leading row used only for prev_close)
             feat_mat = feat_mat[-MIN_BARS:]  # (60, 7)
-            closes = np.array([b["close"] for b in bars], dtype=np.float64)[-MIN_BARS:]
-            highs  = np.array([b["high"]  for b in bars], dtype=np.float64)[-MIN_BARS:]
-            lows   = np.array([b["low"]   for b in bars], dtype=np.float64)[-MIN_BARS:]
 
-            # Technical indicators (cols 7–9)
-            rsi_vals  = compute_rsi(closes).astype(np.float32)[-MIN_BARS:]
-            macd_vals = compute_macd_hist(closes).astype(np.float32)[-MIN_BARS:]
-            atr_vals  = compute_atr(highs, lows, closes).astype(np.float32)[-MIN_BARS:]
+            # Technical indicators: compute on ALL bars the accumulator holds so that
+            # MACD has its full 34-bar warmup (EMA-26 + signal EMA-9) before we slice
+            # to the last MIN_BARS values. Computing on only 60 bars leaves bars 0-33
+            # zero-filled, which never happened in training.
+            all_bars   = acc.get_bars()
+            all_closes = np.array([b["close"] for b in all_bars], dtype=np.float64)
+            all_highs  = np.array([b["high"]  for b in all_bars], dtype=np.float64)
+            all_lows   = np.array([b["low"]   for b in all_bars], dtype=np.float64)
+
+            rsi_vals  = compute_rsi(all_closes).astype(np.float32)[-MIN_BARS:]
+            macd_vals = compute_macd_hist(all_closes).astype(np.float32)[-MIN_BARS:]
+            atr_vals  = compute_atr(all_highs, all_lows, all_closes).astype(np.float32)[-MIN_BARS:]
 
             # Nifty50 log returns (col 10)
             nifty_bars = self.nifty_acc.get_bars()
@@ -355,50 +360,165 @@ class InferenceConsumer:
             logger.error(f"Inference error for {symbol}: {e}")
             model_manager.circuit_breaker_fallback(symbol)
 
-    def _warm_start_from_parquet(self) -> Dict[str, List[Dict]]:
-        """Pre-load last MIN_BARS+5 bars per stock from parquet so inference starts immediately."""
-        parquet_dir = "data/historical"
-        warm_bars: Dict[str, List[Dict]] = {}
+    def _warm_start_from_influxdb(self) -> Dict[str, List[Dict]]:
+        """
+        Pre-load the last 105 completed 1-min bars per stock from the previous
+        trading session's final 105 minutes (1:45–3:30 PM IST) stored in InfluxDB.
 
-        def _parquet_to_bars(path: str) -> List[Dict]:
-            df = pd.read_parquet(path, columns=["timestamp", "open", "high", "low", "close", "volume"])
-            df = df.tail(MIN_BARS + 5)
-            bars = []
-            for _, row in df.iterrows():
-                ts = pd.to_datetime(row["timestamp"])
-                if ts.tzinfo is None:
-                    ts = ts.tz_localize("UTC")
-                bars.append({
+        Handles two timestamp regimes automatically:
+          - Correct UTC storage (2026-05-27 onwards): 1:45 PM IST = 08:15 UTC stored as 08:15 UTC.
+          - Bugged UTC storage (2026-05-26 data): same tick stored at 08:15 - 5:30 = 02:45 UTC.
+        Tries the correct window first; falls back to the bugged window if empty.
+
+        Retries up to 3 previous trading days to handle NSE holidays automatically.
+        Stocks with no InfluxDB data are silently skipped — they accumulate 60
+        live bars before inference starts (no crash, just delayed first prediction).
+        """
+        try:
+            from influxdb_client import InfluxDBClient
+        except ImportError:
+            logger.warning("influxdb_client not installed — skipping InfluxDB warm-start")
+            return {}
+
+        IST          = timedelta(hours=5, minutes=30)
+        TARGET_BARS  = MIN_BARS + 45        # 105: full MACD(26+9) warmup head-room
+        IST_START    = 13 * 60 + 45         # 1:45 PM in minutes-since-midnight
+        IST_END      = 15 * 60 + 30         # 3:30 PM
+
+        def _prev_trading_day(d):
+            d -= timedelta(days=1)
+            while d.weekday() >= 5:         # skip Sat=5, Sun=6
+                d -= timedelta(days=1)
+            return d
+
+        def _build_bars(df: pd.DataFrame, apply_correction: bool) -> pd.DataFrame:
+            """Aggregate a tick DataFrame into 1-min OHLCV bars, filtered to IST window."""
+            times = pd.to_datetime(df["_time"], utc=True)
+            if apply_correction:
+                times = times + IST          # undo the -5:30h storage bug → true UTC
+            df = df.copy()
+            df.index = times
+            df = df.sort_index()
+
+            lp  = df["last_price"].dropna()
+            vol = df["volume"].dropna()
+
+            bars = pd.DataFrame({
+                "open":    lp.resample("1min").first(),
+                "high":    lp.resample("1min").max(),
+                "low":     lp.resample("1min").min(),
+                "close":   lp.resample("1min").last(),
+                "vol_max": vol.resample("1min").max(),
+                "vol_min": vol.resample("1min").min(),
+            })
+            bars["volume"] = (bars["vol_max"] - bars["vol_min"]).clip(lower=0)
+            bars = bars[["open", "high", "low", "close", "volume"]].dropna(subset=["open", "close"])
+
+            # Filter to IST 1:45–3:30 PM (vectorised; index is true UTC after correction)
+            ist_idx = bars.index + IST
+            ist_min = ist_idx.hour * 60 + ist_idx.minute
+            bars    = bars[(ist_min >= IST_START) & (ist_min <= IST_END)]
+            return bars.tail(TARGET_BARS)
+
+        def _to_bar_list(bars_df: pd.DataFrame) -> List[Dict]:
+            return [
+                {
                     "open":   float(row["open"]),
                     "high":   float(row["high"]),
                     "low":    float(row["low"]),
                     "close":  float(row["close"]),
                     "volume": float(row["volume"]),
-                    "ts":     ts.to_pydatetime(),
-                })
-            return bars
+                    "ts":     idx.to_pydatetime(),
+                }
+                for idx, row in bars_df.iterrows()
+            ]
 
-        # Per-stock warm-start
-        for symbol in settings.stock_list:
-            path = os.path.join(parquet_dir, f"{symbol}.parquet")
-            if not os.path.exists(path):
-                continue
+        warm_bars: Dict[str, List[Dict]] = {}
+        today = datetime.now(tz=timezone.utc).date()
+
+        for lookback in range(1, 4):         # try prev day, day-2, day-3 (NSE holidays)
+            day = today
+            for _ in range(lookback):
+                day = _prev_trading_day(day)
+
+            logger.info(f"Warm-start: querying InfluxDB for {day} session tail...")
+
+            # Correct UTC window  (2026-05-27+): 1:45 PM IST = 08:15 UTC → query 08:10–10:05
+            # Bugged  UTC window  (2026-05-26):  same tick stored at 02:45 UTC → query 02:40–04:35
+            windows = [
+                (f"{day}T08:10:00Z", f"{day}T10:05:00Z", False),   # correct
+                (f"{day}T02:40:00Z", f"{day}T04:35:00Z", True),    # bugged (-5:30h offset)
+            ]
+
+            client = InfluxDBClient(
+                url=f"http://{settings.influxdb_host}:{settings.influxdb_port}",
+                org=settings.influxdb_org,
+                token=settings.influxdb_token,
+            )
             try:
-                warm_bars[symbol] = _parquet_to_bars(path)
-            except Exception as e:
-                logger.warning(f"Could not warm-start {symbol} from parquet: {e}")
+                raw            = pd.DataFrame()
+                correction_used = False
 
-        # Nifty50 index warm-start
-        nifty_path = os.path.join(parquet_dir, "NIFTY50.parquet")
-        if os.path.exists(nifty_path):
-            try:
-                for bar in _parquet_to_bars(nifty_path):
-                    self.nifty_acc.completed.append(bar)
-                logger.info(f"Nifty50 warm-started with {len(self.nifty_acc.completed)} bars")
-            except Exception as e:
-                logger.warning(f"Could not warm-start Nifty50 from parquet: {e}")
+                for start, stop, apply_correction in windows:
+                    flux = f'''
+from(bucket: "{settings.influxdb_bucket}")
+  |> range(start: {start}, stop: {stop})
+  |> filter(fn: (r) => r["_measurement"] == "ticks")
+  |> filter(fn: (r) => r["_field"] == "last_price" or r["_field"] == "volume")
+  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> sort(columns: ["_time"])
+'''
+                    try:
+                        result = client.query_api().query_data_frame(flux)
+                        if isinstance(result, list):
+                            result = pd.concat(result, ignore_index=True) if result else pd.DataFrame()
+                        if (result is not None and not result.empty
+                                and "symbol" in result.columns
+                                and len(result) > 100):
+                            raw             = result
+                            correction_used = apply_correction
+                            break
+                    except Exception as e:
+                        logger.warning(f"InfluxDB query error ({start}→{stop}): {e}")
 
-        logger.info(f"Parquet warm-start complete: {len(warm_bars)}/{len(settings.stock_list)} stocks ready")
+                if raw.empty or not {"_time", "last_price", "volume", "symbol"}.issubset(raw.columns):
+                    logger.warning(f"No usable data found for {day}, trying earlier day...")
+                    continue
+
+                found = 0
+                for symbol in settings.stock_list:
+                    sym_df = raw[raw["symbol"] == symbol]
+                    if sym_df.empty:
+                        continue
+                    bars_df = _build_bars(sym_df, correction_used)
+                    if len(bars_df) >= 10:
+                        warm_bars[symbol] = _to_bar_list(bars_df)
+                        found += 1
+
+                # Nifty50: match by instrument_token tag (symbol name varies by broker config)
+                if "instrument_token" in raw.columns:
+                    nifty_df = raw[raw["instrument_token"].astype(str) == str(NIFTY50_TOKEN)]
+                    if not nifty_df.empty:
+                        nifty_bars_df = _build_bars(nifty_df, correction_used)
+                        for bar in _to_bar_list(nifty_bars_df):
+                            self.nifty_acc.completed.append(bar)
+                        logger.info(f"Nifty50 warm-started: {len(self.nifty_acc.completed)} bars from {day}")
+
+                label = "corrected-UTC" if correction_used else "correct-UTC"
+                logger.info(
+                    f"InfluxDB warm-start: {found}/{len(settings.stock_list)} stocks "
+                    f"from {day} ({label})"
+                )
+
+                if found >= len(settings.stock_list) // 2:
+                    break                               # enough stocks — done
+                else:
+                    logger.warning(f"Only {found} stocks found for {day}, trying earlier day...")
+                    warm_bars.clear()
+
+            finally:
+                client.close()
+
         return warm_bars
 
     def consume(self):
@@ -425,7 +545,7 @@ class InferenceConsumer:
 
                     # Per-stock bar accumulation
                     if instrument_token not in self.accumulators:
-                        acc = BarAccumulator(maxlen=MIN_BARS)
+                        acc = BarAccumulator(maxlen=MIN_BARS + 40)
                         if symbol in self.warm_bars:
                             for bar in self.warm_bars.pop(symbol):
                                 acc.completed.append(bar)
