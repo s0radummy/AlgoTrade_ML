@@ -1,110 +1,34 @@
 import json
 import os
 import signal
+import time
 import torch
-import pandas as pd
-from collections import deque
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 from kafka import KafkaConsumer
 from kafka.errors import KafkaError
-from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Tuple
-import numpy as np
 
 from config.settings import settings
-from src.utils.logger import setup_logger
 from src.core.redis_client import redis_client
-from src.models.model_manager import model_manager
+from src.data.dataset import _build_static_cov
+from src.data.features import compute_atr, compute_macd_hist, compute_rsi
 from src.data.instrument_loader import instrument_loader
 from src.data.tick_validator import tick_validator
-from src.data.dataset import _build_static_cov
-from src.data.features import compute_rsi, compute_macd_hist, compute_atr
+from src.models.model_manager import model_manager
+from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
-
-# Nifty50 index instrument token (stable across all KiteConnect accounts)
-NIFTY50_TOKEN = 256265
 
 # Minimum completed 1-minute bars required before running inference
 MIN_BARS = 60
 
 
-class BarAccumulator:
-    """
-    Converts a stream of raw KiteConnect ticks into completed 1-minute OHLCV bars.
-
-    KiteConnect ticks carry cumulative daily volume (volume_traded), so bar volume
-    is computed as the delta between the first and last tick in each minute.
-
-    Maintains a deque of completed bars. Call get_bars() to get completed bars
-    plus the current in-progress bar for immediate use in inference.
-    """
-
-    def __init__(self, maxlen: int = 60):
-        self.completed: deque = deque(maxlen=maxlen)
-        self._bar: Optional[Dict] = None          # current in-progress bar
-        self._bar_key: Optional[Tuple] = None     # (year, month, day, hour, minute)
-        self._bar_start_vol: float = 0.0          # cumulative volume at bar open
-
-    def update(self, tick: Dict) -> bool:
-        """
-        Ingest one tick. Returns True when a bar is completed (minute boundary crossed).
-        Ticks from KiteConnect carry exchange_timestamp in milliseconds.
-        """
-        ts_ms = tick.get("exchange_timestamp") or tick.get("timestamp", 0)
-        if ts_ms:
-            try:
-                if isinstance(ts_ms, str):
-                    ts = datetime.fromisoformat(ts_ms).replace(tzinfo=timezone.utc)
-                else:
-                    ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-            except (OSError, OverflowError, ValueError):
-                ts = datetime.now(tz=timezone.utc)
-        else:
-            ts = datetime.now(tz=timezone.utc)
-
-        bar_key = (ts.year, ts.month, ts.day, ts.hour, ts.minute)
-        ltp     = float(tick.get("last_price", 0.0))
-        cum_vol = float(tick.get("volume_traded", tick.get("volume", 0.0)))
-
-        if bar_key != self._bar_key:
-            completed_bar = False
-            if self._bar is not None:
-                self.completed.append(self._bar)
-                completed_bar = True
-            self._bar = {
-                "open":   ltp,
-                "high":   ltp,
-                "low":    ltp,
-                "close":  ltp,
-                "volume": 0.0,
-                "ts":     ts,
-            }
-            self._bar_key    = bar_key
-            self._bar_start_vol = cum_vol
-            return completed_bar
-        else:
-            if ltp > 0:
-                self._bar["high"]  = max(self._bar["high"], ltp)
-                self._bar["low"]   = min(self._bar["low"],  ltp)
-                self._bar["close"] = ltp
-            self._bar["volume"] = max(0.0, cum_vol - self._bar_start_vol)
-            return False
-
-    def get_bars(self) -> List[Dict]:
-        """Completed bars + current in-progress bar (most recent last)."""
-        bars = list(self.completed)
-        if self._bar is not None:
-            bars.append(self._bar)
-        return bars
-
-    def ready(self) -> bool:
-        return len(self.completed) >= MIN_BARS
-
-
 class InferenceConsumer:
     """
-    Consumes ticks from Kafka, accumulates them into 1-minute OHLCV bars,
-    runs TFT inference after each completed bar, and caches predictions in Redis.
+    Reads ticks from Kafka to detect minute-boundary crossings, then reads the
+    completed bars written by VizConsumer from Redis and runs TFT inference.
 
     Feature layout for past_inputs (60, 11) — matches src/data/dataset.py exactly:
       col  0: log_ret          (z-scored per stock)
@@ -114,33 +38,25 @@ class InferenceConsumer:
       col  4: intraday_ret     = log(close / open)
       col  5: intraday_rng     = log(high / low)
       col  6: vol_norm         = log1p(bar_vol / mean_bar_vol)
-      col  7: rsi_14           (compute_rsi from features.py)
-      col  8: macd_hist_norm   (compute_macd_hist from features.py)
-      col  9: atr_norm         (compute_atr from features.py)
-      col 10: nifty_log_ret    (Nifty50 index 1-min log return, raw)
-
-    Predictions are denormalized from z-score space using per-stock target_stats
-    loaded from the checkpoint before writing to Redis.
+      col  7: rsi_14
+      col  8: macd_hist_norm
+      col  9: atr_norm
+      col 10: nifty_log_ret    (from STOCK:NIFTY50:bars in Redis)
     """
 
     def __init__(self, group_id: str = "inference-grp"):
-        self.group_id = group_id
-        self.running  = False
-        self.consumer = None
-
-        # Per-stock bar accumulators: {instrument_token: BarAccumulator}
-        self.accumulators: Dict[str, BarAccumulator] = {}
-
-        # Shared Nifty50 bar accumulator (instrument_token == NIFTY50_TOKEN)
-        self.nifty_acc = BarAccumulator(maxlen=MIN_BARS + 40)
-
+        self.group_id      = group_id
+        self.running       = False
+        self.consumer      = None
         self.message_count = 0
         self.target_stats: dict = {}
+
+        # Last-seen minute per symbol for boundary detection: {symbol: (y,m,d,h,min)}
+        self._last_minute: Dict[str, Tuple] = {}
 
         self.initialize_consumer()
         self._load_target_stats()
         self._register_signal_handlers()
-        self.warm_bars: Dict[str, List[Dict]] = self._warm_start_from_influxdb()
 
     def initialize_consumer(self):
         try:
@@ -150,9 +66,10 @@ class InferenceConsumer:
                 group_id=self.group_id,
                 auto_offset_reset="latest",
                 enable_auto_commit=True,
-                value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+                value_deserializer=lambda m: json.loads(m.decode("utf-8")),
                 max_poll_records=100,
                 session_timeout_ms=30000,
+                consumer_timeout_ms=1000,
             )
             logger.info(f"Inference consumer initialized (group: {self.group_id})")
         except Exception as e:
@@ -160,7 +77,6 @@ class InferenceConsumer:
             raise
 
     def _load_target_stats(self):
-        """Load per-stock target normalization stats from the model checkpoint."""
         try:
             if os.path.exists(settings.model_path):
                 ckpt = torch.load(settings.model_path, map_location="cpu", weights_only=False)
@@ -172,7 +88,10 @@ class InferenceConsumer:
             logger.warning(f"Could not load target_stats from checkpoint: {e}")
 
     def _register_signal_handlers(self):
-        signal.signal(signal.SIGTERM, self._shutdown_handler)
+        try:
+            signal.signal(signal.SIGTERM, self._shutdown_handler)
+        except (OSError, ValueError):
+            pass
         signal.signal(signal.SIGINT, self._shutdown_handler)
 
     def _shutdown_handler(self, signum, frame):
@@ -180,24 +99,19 @@ class InferenceConsumer:
         self.stop()
 
     def _bars_to_features(self, bars: List[Dict]) -> Optional[np.ndarray]:
-        """
-        Convert a list of 1-min OHLCV bars to the (N, 11) feature matrix
-        that matches dataset.py _load_stock exactly.
-
-        Returns None if fewer than 2 bars (need prev_close for log returns).
-        """
+        """Convert list of OHLCV bar dicts to (N, 7) feature array (cols 0–6)."""
         n = len(bars)
         if n < 2:
             return None
 
-        close = np.array([b["close"] for b in bars], dtype=np.float64)
-        open_ = np.array([b["open"]  for b in bars], dtype=np.float64)
-        high  = np.array([b["high"]  for b in bars], dtype=np.float64)
-        low   = np.array([b["low"]   for b in bars], dtype=np.float64)
+        close = np.array([b["close"]  for b in bars], dtype=np.float64)
+        open_ = np.array([b["open"]   for b in bars], dtype=np.float64)
+        high  = np.array([b["high"]   for b in bars], dtype=np.float64)
+        low   = np.array([b["low"]    for b in bars], dtype=np.float64)
         vol   = np.array([b["volume"] for b in bars], dtype=np.float64)
 
-        prev_close    = np.empty_like(close)
-        prev_close[0] = open_[0]
+        prev_close     = np.empty_like(close)
+        prev_close[0]  = open_[0]
         prev_close[1:] = close[:-1]
 
         pos_vol  = vol[vol > 0]
@@ -217,68 +131,58 @@ class InferenceConsumer:
             intraday_ret, intraday_rng, vol_norm,
         ]).astype(np.float32)
 
-    def construct_input_tensor(self, instrument_token: str, symbol: str) -> Optional[Dict]:
+    def construct_input_tensor(
+        self,
+        symbol: str,
+        bars: List[Dict],
+        nifty_bars: List[Dict],
+    ) -> Optional[Dict]:
         """
-        Build TFT input tensors from the accumulated 1-min bars for this stock.
-        Returns {static_cov, past_inputs, future_inputs} or None if not ready.
+        Build TFT input tensors from Redis bar lists (chronological, oldest first).
+        Returns {static_cov, past_inputs, future_inputs} or None if not enough data.
         """
         try:
-            acc = self.accumulators.get(instrument_token)
-            if acc is None or not acc.ready():
-                logger.debug(f"[{symbol}] construct: acc not ready (completed={len(acc.completed) if acc else 'None'})")
-                return None
-
-            bars = acc.get_bars()
             if len(bars) < MIN_BARS + 1:
-                logger.debug(f"[{symbol}] construct: not enough bars ({len(bars)} < {MIN_BARS + 1})")
+                logger.debug(f"[{symbol}] Not enough bars ({len(bars)} < {MIN_BARS + 1})")
                 return None
 
-            # Use the last MIN_BARS+1 bars so we have prev_close for bar[0]
-            bars = bars[-(MIN_BARS + 1):]
-            feat_mat = self._bars_to_features(bars)  # (MIN_BARS+1, 7) or None
+            # Feature matrix: need MIN_BARS+1 bars to compute first prev_close
+            bars_slice = bars[-(MIN_BARS + 1):]
+            feat_mat   = self._bars_to_features(bars_slice)
             if feat_mat is None:
                 return None
-
-            # Take the last MIN_BARS rows (drop the leading row used only for prev_close)
             feat_mat = feat_mat[-MIN_BARS:]  # (60, 7)
 
-            # Technical indicators: compute on ALL bars the accumulator holds so that
-            # MACD has its full 34-bar warmup (EMA-26 + signal EMA-9) before we slice
-            # to the last MIN_BARS values. Computing on only 60 bars leaves bars 0-33
-            # zero-filled, which never happened in training.
-            all_bars   = acc.get_bars()
-            all_closes = np.array([b["close"] for b in all_bars], dtype=np.float64)
-            all_highs  = np.array([b["high"]  for b in all_bars], dtype=np.float64)
-            all_lows   = np.array([b["low"]   for b in all_bars], dtype=np.float64)
+            # Technical indicators computed on ALL available bars for full MACD warmup
+            all_closes = np.array([b["close"] for b in bars], dtype=np.float64)
+            all_highs  = np.array([b["high"]  for b in bars], dtype=np.float64)
+            all_lows   = np.array([b["low"]   for b in bars], dtype=np.float64)
 
             rsi_vals  = compute_rsi(all_closes).astype(np.float32)[-MIN_BARS:]
             macd_vals = compute_macd_hist(all_closes).astype(np.float32)[-MIN_BARS:]
             atr_vals  = compute_atr(all_highs, all_lows, all_closes).astype(np.float32)[-MIN_BARS:]
 
             # Nifty50 log returns (col 10)
-            nifty_bars = self.nifty_acc.get_bars()
             if len(nifty_bars) >= 2:
                 nifty_close = np.array([b["close"] for b in nifty_bars], dtype=np.float64)
                 with np.errstate(divide="ignore", invalid="ignore"):
                     nifty_lr = np.log(nifty_close[1:] / nifty_close[:-1])
                 nifty_lr = np.nan_to_num(nifty_lr, nan=0.0, posinf=0.0, neginf=0.0)
-                # Align length to MIN_BARS; pad front with zeros if shorter
                 if len(nifty_lr) < MIN_BARS:
                     nifty_lr = np.concatenate([np.zeros(MIN_BARS - len(nifty_lr)), nifty_lr])
                 else:
                     nifty_lr = nifty_lr[-MIN_BARS:]
             else:
                 nifty_lr = np.zeros(MIN_BARS, dtype=np.float32)
-
             nifty_lr = nifty_lr.astype(np.float32)
 
-            # Assemble (60, 11) — col order matches dataset.py
+            # Assemble (60, 11)
             past_mat = np.column_stack([
-                feat_mat,                          # cols 0–6
-                rsi_vals[:, None],                 # col 7
-                macd_vals[:, None],                # col 8
-                atr_vals[:, None],                 # col 9
-                nifty_lr[:, None],                 # col 10
+                feat_mat,
+                rsi_vals[:, None],
+                macd_vals[:, None],
+                atr_vals[:, None],
+                nifty_lr[:, None],
             ])
             past_mat = np.nan_to_num(past_mat, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -289,15 +193,20 @@ class InferenceConsumer:
             if target_std > 0:
                 past_mat[:, 0] = (past_mat[:, 0] - target_mean) / target_std
 
-            # Static covariates
-            static_np  = _build_static_cov(symbol, target_std=target_std)
-            static_cov = torch.from_numpy(static_np).unsqueeze(0).float()  # (1, 32)
+            static_np   = _build_static_cov(symbol, target_std=target_std)
+            static_cov  = torch.from_numpy(static_np).unsqueeze(0).float()
+            past_inputs = torch.from_numpy(past_mat).unsqueeze(0).float()
 
-            past_inputs = torch.from_numpy(past_mat).unsqueeze(0).float()  # (1, 60, 11)
+            # Future inputs built from last completed bar's timestamp
+            last_bar_ts_str = bars[-1].get("ts", "")
+            try:
+                last_bar_ts = datetime.fromisoformat(last_bar_ts_str)
+                if last_bar_ts.tzinfo is None:
+                    last_bar_ts = last_bar_ts.replace(tzinfo=timezone.utc)
+            except (ValueError, AttributeError):
+                last_bar_ts = datetime.now(tz=timezone.utc)
 
-            # Future inputs — cyclical time + calendar (matches dataset.py calendar encoding)
-            last_bar_ts = bars[-1].get("ts", datetime.now(tz=timezone.utc))
-            open_min_utc   = 3 * 60 + 45          # 09:15 IST = 03:45 UTC
+            open_min_utc    = 3 * 60 + 45   # 09:15 IST = 03:45 UTC
             mins_since_open = (last_bar_ts.hour * 60 + last_bar_ts.minute) - open_min_utc
 
             future_feats = []
@@ -309,7 +218,7 @@ class InferenceConsumer:
                     float(last_bar_ts.weekday()) / 4.0,
                     float(last_bar_ts.day) / 31.0,
                 ])
-            future_inputs = torch.tensor(future_feats, dtype=torch.float32).unsqueeze(0)  # (1, 5, 4)
+            future_inputs = torch.tensor(future_feats, dtype=torch.float32).unsqueeze(0)
 
             return {
                 "static_cov":    static_cov,
@@ -321,20 +230,20 @@ class InferenceConsumer:
             logger.error(f"Error constructing input tensor for {symbol}: {e}")
             return None
 
-    def run_inference(self, instrument_token: str, symbol: str):
-        """Run TFT inference and cache denormalized predictions in Redis."""
+    def run_inference(self, symbol: str, bars: List[Dict], nifty_bars: List[Dict]):
+        """Run TFT inference and write denormalized predictions to Redis."""
         try:
-            inputs = self.construct_input_tensor(instrument_token, symbol)
+            inputs = self.construct_input_tensor(symbol, bars, nifty_bars)
             if inputs is None:
                 return
 
-            predictions = model_manager.predict(
+            predictions  = model_manager.predict(
                 inputs["static_cov"],
                 inputs["past_inputs"],
                 inputs["future_inputs"],
             )
 
-            preds = predictions[0].cpu().numpy()  # (5 steps, 5 quantiles) — z-score space
+            preds = predictions[0].cpu().numpy()  # (5 steps, 5 quantiles) in z-score space
 
             stats        = self.target_stats.get(symbol, {"mean": 0.0, "std": 1.0})
             preds_denorm = preds * stats["std"] + stats["mean"]
@@ -348,228 +257,115 @@ class InferenceConsumer:
                 "timestamp": datetime.now(tz=timezone.utc).isoformat(),
             }
 
-            logger.debug(f"[{symbol}] Writing prediction P50={quantiles_dict['P50']:.6f} to Redis (ttl={settings.model_cache_ttl}s)")
-            model_manager.cache_prediction(
-                symbol,
-                quantiles_dict,
+            all_steps = [
+                {
+                    "P10": float(preds_denorm[s, 0]),
+                    "P30": float(preds_denorm[s, 1]),
+                    "P50": float(preds_denorm[s, 2]),
+                    "P70": float(preds_denorm[s, 3]),
+                    "P90": float(preds_denorm[s, 4]),
+                }
+                for s in range(preds_denorm.shape[0])
+            ]
+
+            # Current LTP from the live bar written by VizConsumer
+            current_bar  = redis_client.hgetall(f"STOCK:{symbol}:current_bar")
+            current_ltp  = float(current_bar.get("LTP", 0) or 0)
+
+            redis_client.set(
+                f"PRED:{symbol}:steps",
+                json.dumps({
+                    "steps":     all_steps,
+                    "ltp":       current_ltp,
+                    "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                }),
                 ttl=settings.model_cache_ttl,
             )
-            logger.debug(f"[{symbol}] Prediction cached OK")
+
+            logger.debug(f"[{symbol}] P50={quantiles_dict['P50']:.6f}")
+            model_manager.cache_prediction(symbol, quantiles_dict, ttl=settings.model_cache_ttl)
 
         except Exception as e:
             logger.error(f"Inference error for {symbol}: {e}")
             model_manager.circuit_breaker_fallback(symbol)
 
-    def _warm_start_from_influxdb(self) -> Dict[str, List[Dict]]:
+    def _trigger_inference(self, symbol: str):
         """
-        Pre-load the last 105 completed 1-min bars per stock from the previous
-        trading session's final 105 minutes (1:45–3:30 PM IST) stored in InfluxDB.
-
-        Handles two timestamp regimes automatically:
-          - Correct UTC storage (2026-05-27 onwards): 1:45 PM IST = 08:15 UTC stored as 08:15 UTC.
-          - Bugged UTC storage (2026-05-26 data): same tick stored at 08:15 - 5:30 = 02:45 UTC.
-        Tries the correct window first; falls back to the bugged window if empty.
-
-        Retries up to 3 previous trading days to handle NSE holidays automatically.
-        Stocks with no InfluxDB data are silently skipped — they accumulate 60
-        live bars before inference starts (no crash, just delayed first prediction).
+        Read bars from Redis and run inference after a minute-boundary is detected.
+        100ms retry guards against the narrow race where VizConsumer hasn't yet written
+        the completed bar (almost never fires in practice).
         """
-        try:
-            from influxdb_client import InfluxDBClient
-        except ImportError:
-            logger.warning("influxdb_client not installed — skipping InfluxDB warm-start")
-            return {}
+        newest_raw = redis_client.lindex(f"STOCK:{symbol}:bars", 0)
+        if newest_raw is None:
+            time.sleep(0.1)
+            newest_raw = redis_client.lindex(f"STOCK:{symbol}:bars", 0)
+            if newest_raw is None:
+                logger.debug(f"[{symbol}] No bars in Redis yet — skipping")
+                return
 
-        IST          = timedelta(hours=5, minutes=30)
-        TARGET_BARS  = MIN_BARS + 45        # 105: full MACD(26+9) warmup head-room
-        IST_START    = 13 * 60 + 45         # 1:45 PM in minutes-since-midnight
-        IST_END      = 15 * 60 + 30         # 3:30 PM
+        bars_raw  = redis_client.lrange(f"STOCK:{symbol}:bars", 0, 99)
+        nifty_raw = redis_client.lrange("STOCK:NIFTY50:bars",   0, 99)
 
-        def _prev_trading_day(d):
-            d -= timedelta(days=1)
-            while d.weekday() >= 5:         # skip Sat=5, Sun=6
-                d -= timedelta(days=1)
-            return d
-
-        def _build_bars(df: pd.DataFrame, apply_correction: bool) -> pd.DataFrame:
-            """Aggregate a tick DataFrame into 1-min OHLCV bars, filtered to IST window."""
-            times = pd.to_datetime(df["_time"], utc=True)
-            if apply_correction:
-                times = times + IST          # undo the -5:30h storage bug → true UTC
-            df = df.copy()
-            df.index = times
-            df = df.sort_index()
-
-            lp  = df["last_price"].dropna()
-            vol = df["volume"].dropna()
-
-            bars = pd.DataFrame({
-                "open":    lp.resample("1min").first(),
-                "high":    lp.resample("1min").max(),
-                "low":     lp.resample("1min").min(),
-                "close":   lp.resample("1min").last(),
-                "vol_max": vol.resample("1min").max(),
-                "vol_min": vol.resample("1min").min(),
-            })
-            bars["volume"] = (bars["vol_max"] - bars["vol_min"]).clip(lower=0)
-            bars = bars[["open", "high", "low", "close", "volume"]].dropna(subset=["open", "close"])
-
-            # Filter to IST 1:45–3:30 PM (vectorised; index is true UTC after correction)
-            ist_idx = bars.index + IST
-            ist_min = ist_idx.hour * 60 + ist_idx.minute
-            bars    = bars[(ist_min >= IST_START) & (ist_min <= IST_END)]
-            return bars.tail(TARGET_BARS)
-
-        def _to_bar_list(bars_df: pd.DataFrame) -> List[Dict]:
-            return [
-                {
-                    "open":   float(row["open"]),
-                    "high":   float(row["high"]),
-                    "low":    float(row["low"]),
-                    "close":  float(row["close"]),
-                    "volume": float(row["volume"]),
-                    "ts":     idx.to_pydatetime(),
-                }
-                for idx, row in bars_df.iterrows()
-            ]
-
-        warm_bars: Dict[str, List[Dict]] = {}
-        today = datetime.now(tz=timezone.utc).date()
-
-        for lookback in range(1, 4):         # try prev day, day-2, day-3 (NSE holidays)
-            day = today
-            for _ in range(lookback):
-                day = _prev_trading_day(day)
-
-            logger.info(f"Warm-start: querying InfluxDB for {day} session tail...")
-
-            # Correct UTC window  (2026-05-27+): 1:45 PM IST = 08:15 UTC → query 08:10–10:05
-            # Bugged  UTC window  (2026-05-26):  same tick stored at 02:45 UTC → query 02:40–04:35
-            windows = [
-                (f"{day}T08:10:00Z", f"{day}T10:05:00Z", False),   # correct
-                (f"{day}T02:40:00Z", f"{day}T04:35:00Z", True),    # bugged (-5:30h offset)
-            ]
-
-            client = InfluxDBClient(
-                url=f"http://{settings.influxdb_host}:{settings.influxdb_port}",
-                org=settings.influxdb_org,
-                token=settings.influxdb_token,
-            )
+        bars = []
+        for b in reversed(bars_raw):
             try:
-                raw            = pd.DataFrame()
-                correction_used = False
+                bars.append(json.loads(b))
+            except Exception:
+                pass
 
-                for start, stop, apply_correction in windows:
-                    flux = f'''
-from(bucket: "{settings.influxdb_bucket}")
-  |> range(start: {start}, stop: {stop})
-  |> filter(fn: (r) => r["_measurement"] == "ticks")
-  |> filter(fn: (r) => r["_field"] == "last_price" or r["_field"] == "volume")
-  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-  |> sort(columns: ["_time"])
-'''
-                    try:
-                        result = client.query_api().query_data_frame(flux)
-                        if isinstance(result, list):
-                            result = pd.concat(result, ignore_index=True) if result else pd.DataFrame()
-                        if (result is not None and not result.empty
-                                and "symbol" in result.columns
-                                and len(result) > 100):
-                            raw             = result
-                            correction_used = apply_correction
-                            break
-                    except Exception as e:
-                        logger.warning(f"InfluxDB query error ({start}→{stop}): {e}")
+        nifty_bars = []
+        for b in reversed(nifty_raw):
+            try:
+                nifty_bars.append(json.loads(b))
+            except Exception:
+                pass
 
-                if raw.empty or not {"_time", "last_price", "volume", "symbol"}.issubset(raw.columns):
-                    logger.warning(f"No usable data found for {day}, trying earlier day...")
-                    continue
+        if len(bars) < MIN_BARS:
+            logger.debug(f"[{symbol}] Not enough bars ({len(bars)} < {MIN_BARS})")
+            return
 
-                found = 0
-                for symbol in settings.stock_list:
-                    sym_df = raw[raw["symbol"] == symbol]
-                    if sym_df.empty:
-                        continue
-                    bars_df = _build_bars(sym_df, correction_used)
-                    if len(bars_df) >= 10:
-                        warm_bars[symbol] = _to_bar_list(bars_df)
-                        found += 1
-
-                # Nifty50: match by instrument_token tag (symbol name varies by broker config)
-                if "instrument_token" in raw.columns:
-                    nifty_df = raw[raw["instrument_token"].astype(str) == str(NIFTY50_TOKEN)]
-                    if not nifty_df.empty:
-                        nifty_bars_df = _build_bars(nifty_df, correction_used)
-                        for bar in _to_bar_list(nifty_bars_df):
-                            self.nifty_acc.completed.append(bar)
-                        logger.info(f"Nifty50 warm-started: {len(self.nifty_acc.completed)} bars from {day}")
-
-                label = "corrected-UTC" if correction_used else "correct-UTC"
-                logger.info(
-                    f"InfluxDB warm-start: {found}/{len(settings.stock_list)} stocks "
-                    f"from {day} ({label})"
-                )
-
-                if found >= len(settings.stock_list) // 2:
-                    break                               # enough stocks — done
-                else:
-                    logger.warning(f"Only {found} stocks found for {day}, trying earlier day...")
-                    warm_bars.clear()
-
-            finally:
-                client.close()
-
-        return warm_bars
+        if instrument_loader.get_instrument(symbol):
+            self.run_inference(symbol, bars, nifty_bars)
 
     def consume(self):
         self.running = True
-        logger.info("Starting inference consumer (bar-based, 1-min resolution)...")
+        logger.info("Starting inference consumer (Redis-backed, 1-min bars)...")
 
         try:
-            for message in self.consumer:
-                try:
-                    tick = message.value
+            while self.running:
+                for message in self.consumer:
+                    if not self.running:
+                        break
+                    try:
+                        tick = message.value
 
-                    is_valid, error = tick_validator.validate_tick(tick)
-                    if not is_valid:
-                        logger.warning(f"Invalid tick: {error}")
+                        is_valid, error = tick_validator.validate_tick(tick)
+                        if not is_valid:
+                            continue
+
+                        symbol = tick.get("symbol", "")
+                        if not symbol or symbol == "NIFTY50":
+                            continue
+
+                        try:
+                            ts = datetime.fromisoformat(tick.get("timestamp", ""))
+                            current_minute = (ts.year, ts.month, ts.day, ts.hour, ts.minute)
+                        except (ValueError, AttributeError):
+                            continue
+
+                        last_minute = self._last_minute.get(symbol)
+                        self._last_minute[symbol] = current_minute
+
+                        if last_minute is not None and current_minute != last_minute:
+                            self._trigger_inference(symbol)
+
+                        self.message_count += 1
+                        if self.message_count % 100 == 0:
+                            logger.info(f"Processed {self.message_count} ticks")
+
+                    except Exception as e:
+                        logger.error(f"Error processing message: {e}")
                         continue
-
-                    instrument_token = str(tick.get("instrument_token", ""))
-                    symbol           = tick.get("symbol", "")
-
-                    # Route Nifty50 index ticks to the shared accumulator
-                    if instrument_token == str(NIFTY50_TOKEN):
-                        self.nifty_acc.update(tick)
-                        continue
-
-                    # Per-stock bar accumulation
-                    if instrument_token not in self.accumulators:
-                        acc = BarAccumulator(maxlen=MIN_BARS + 40)
-                        if symbol in self.warm_bars:
-                            for bar in self.warm_bars.pop(symbol):
-                                acc.completed.append(bar)
-                            logger.info(f"Warm-started {symbol} with {len(acc.completed)} historical bars")
-                        self.accumulators[instrument_token] = acc
-
-                    bar_completed = self.accumulators[instrument_token].update(tick)
-
-                    if bar_completed:
-                        logger.debug(f"Bar completed for {symbol} (ready={self.accumulators[instrument_token].ready()})")
-
-                    # Run inference whenever a bar is completed and we have enough history
-                    if bar_completed and self.accumulators[instrument_token].ready():
-                        instrument_data = instrument_loader.get_instrument(symbol)
-                        if instrument_data:
-                            self.run_inference(instrument_token, symbol)
-
-                    self.message_count += 1
-                    if self.message_count % 100 == 0:
-                        logger.info(f"Processed {self.message_count} ticks")
-
-                except Exception as e:
-                    logger.error(f"Error processing message: {e}")
-                    continue
 
         except KafkaError as e:
             logger.error(f"Kafka error: {e}")

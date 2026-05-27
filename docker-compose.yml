@@ -90,34 +90,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # Kafka Producer (KiteConnect WebSocket → Kafka)
-  producer:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.producer
-    container_name: algotrade-producer
-    environment:
-      KITE_API_KEY: ${KITE_API_KEY}
-      KITE_API_SECRET: ${KITE_API_SECRET}
-      KITE_USER_ID: ${KITE_USER_ID}
-      KITE_PASSWORD: ${KITE_PASSWORD}
-      KITE_TWO_FA: ${KITE_TWO_FA}
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      REDIS_HOST: redis
-      LOG_LEVEL: ${LOG_LEVEL}
-    depends_on:
-      kafka:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - algotrade-network
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
   # Inference Consumer (Kafka → TFT → Redis)
   inference-consumer:
     build:

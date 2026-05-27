@@ -231,35 +231,54 @@ def evaluate_stock(
     if n_windows <= 0:
         return []
 
-    # Build batched tensors — (n_windows, 60, 11)
-    past_batch = np.stack([feat_mat[i : i + MIN_BARS] for i in range(n_windows)])
+    # Detect bars with a time gap before them (e.g. network outage, deleted data).
+    # gap_at[k] = True means bars[k] is >90s after bars[k-1] — not a normal 1-min step.
+    bar_ns     = np.array(bars.index.asi8, dtype=np.float64)
+    diffs_ns   = np.concatenate([[60e9], np.diff(bar_ns)])
+    gap_at     = diffs_ns > 90e9
 
-    # Static covariates — broadcast same vector across all windows
+    # Window w is valid iff no gap falls in positions [w+1, w+MIN_BARS].
+    # That range covers both the interior of the input window AND the true-value bar.
+    # Vectorised: gap_cumsum[w+MIN_BARS] == gap_cumsum[w]  ↔  no gap crossed.
+    gap_cumsum    = gap_at.cumsum()
+    valid_mask    = gap_cumsum[MIN_BARS : MIN_BARS + n_windows] == gap_cumsum[:n_windows]
+    valid_indices = np.where(valid_mask)[0]
+
+    if len(valid_indices) == 0:
+        return []
+
+    n_valid = len(valid_indices)
+
+    # Build batched tensors for valid windows only
+    past_batch = np.stack([feat_mat[i : i + MIN_BARS] for i in valid_indices])
+
+    # Static covariates — broadcast same vector across all valid windows
     static_np  = _build_static_cov(symbol, target_std=t_std)
-    static_t   = torch.from_numpy(static_np).unsqueeze(0).expand(n_windows, -1).float()  # (n_windows, 32)
+    static_t   = torch.from_numpy(static_np).unsqueeze(0).expand(n_valid, -1).float()
 
-    # Future inputs — (n_windows, 5, 4)
-    future_batch = build_future_inputs_batch(timestamps, n_windows)
+    # Future inputs — compute for all windows, then filter to valid
+    future_batch = build_future_inputs_batch(timestamps, n_windows)[valid_indices]
 
     past_t   = torch.from_numpy(past_batch).float()
     future_t = torch.from_numpy(future_batch).float()
 
     with torch.no_grad():
-        output = model(static_t, past_t, future_t)   # (n_windows, 5, 5) in z-score space
+        output = model(static_t, past_t, future_t)   # (n_valid, 5, 5) in z-score space
 
-    preds_z  = output.cpu().numpy()              # (n_windows, 5, 5)
+    preds_z  = output.cpu().numpy()              # (n_valid, 5, 5)
     preds    = preds_z * t_std + t_mean          # denormalize to raw log-return scale
 
-    # Ground truth: log return at bar (i+MIN_BARS) vs bar (i+MIN_BARS-1)
-    # close[i+MIN_BARS] / close[i+MIN_BARS-1] for i=0..n_windows-1
+    # Ground truth: precompute for all n_windows, index with valid_indices.
+    # actual_lrs[i] = log(closes[i+MIN_BARS] / closes[i+MIN_BARS-1]) — valid because
+    # gap_at[i+MIN_BARS] is False for every i in valid_indices (guaranteed above).
     actual_lrs = np.log(
         closes[MIN_BARS : MIN_BARS + n_windows] /
         closes[MIN_BARS - 1 : MIN_BARS + n_windows - 1]
     )
 
     results = []
-    for i in range(n_windows):
-        p10, p30, p50, p70, p90 = preds[i, 0]   # step+1 only
+    for j, i in enumerate(valid_indices):
+        p10, p30, p50, p70, p90 = preds[j, 0]   # step+1 only
         actual   = float(actual_lrs[i])
         dir_ok   = int(p50 * actual > 0)
 

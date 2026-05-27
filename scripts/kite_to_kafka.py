@@ -48,10 +48,11 @@ _STOCKS_DEFAULT = (
     "TATACONSUM,TATASTEEL,TCS,TECHM,TITAN,"
     "ULTRACEMCO,WIPRO"
 )
-STOCKS      = [s.strip() for s in os.getenv("STOCKS", _STOCKS_DEFAULT).split(",")]
-BOOTSTRAP   = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:29092")
-TOPIC       = os.getenv("KAFKA_TOPIC", "stock-quotes")
+STOCKS        = [s.strip() for s in os.getenv("STOCKS", _STOCKS_DEFAULT).split(",")]
+BOOTSTRAP     = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:29092")
+TOPIC         = os.getenv("KAFKA_TOPIC", "stock-quotes")
 SESSION_CACHE = ".kite_session.json"
+NIFTY50_TOKEN = 256265   # NSE:NIFTY 50 — stable across all KiteConnect accounts
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
 RESET   = "\033[0m"
@@ -269,7 +270,8 @@ def main():
     if not token_map:
         print("No instruments resolved — check your STOCKS list in .env")
         sys.exit(1)
-    print(f"  → {len(token_map)} instruments resolved\n")
+    token_map[NIFTY50_TOKEN] = "NIFTY50"
+    print(f"  → {len(token_map)} instruments resolved (incl. NIFTY50)\n")
 
     # Connect Kafka producer
     try:
@@ -344,8 +346,9 @@ def main():
     def on_connect(ws, response):
         tokens = list(token_map.keys())
         ws.subscribe(tokens)
-        ws.set_mode(ws.MODE_FULL, tokens)
-        print(f"\nSubscribed to {len(tokens)} instruments. Live ticks incoming...\n")
+        ws.set_mode(ws.MODE_FULL, [t for t in tokens if t != NIFTY50_TOKEN])
+        ws.set_mode(ws.MODE_QUOTE, [NIFTY50_TOKEN])
+        print(f"\nSubscribed to {len(tokens)} instruments ({len(tokens)-1} stocks + NIFTY50). Live ticks incoming...\n")
         print(f"{'─'*80}\n")
 
     def on_close(ws, code, reason):

@@ -100,6 +100,39 @@ class RedisClient:
             logger.error(f"Error deleting key {key}: {e}")
             return False
 
+    def lpush(self, key: str, *values: str) -> int:
+        self._ensure_connected()
+        try:
+            return self.client.lpush(key, *values)
+        except Exception as e:
+            logger.error(f"Error lpush on key {key}: {e}")
+            return 0
+
+    def ltrim(self, key: str, start: int, end: int) -> bool:
+        self._ensure_connected()
+        try:
+            self.client.ltrim(key, start, end)
+            return True
+        except Exception as e:
+            logger.error(f"Error ltrim on key {key}: {e}")
+            return False
+
+    def lrange(self, key: str, start: int, end: int) -> list:
+        self._ensure_connected()
+        try:
+            return self.client.lrange(key, start, end)
+        except Exception as e:
+            logger.error(f"Error lrange on key {key}: {e}")
+            return []
+
+    def lindex(self, key: str, index: int) -> Optional[str]:
+        self._ensure_connected()
+        try:
+            return self.client.lindex(key, index)
+        except Exception as e:
+            logger.error(f"Error lindex on key {key}: {e}")
+            return None
+
     def publish(self, channel: str, message: str) -> int:
         self._ensure_connected()
         try:
