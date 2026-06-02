@@ -52,6 +52,7 @@ STOCKS        = [s.strip() for s in os.getenv("STOCKS", _STOCKS_DEFAULT).split("
 BOOTSTRAP     = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:29092")
 TOPIC         = os.getenv("KAFKA_TOPIC", "stock-quotes")
 SESSION_CACHE = ".kite_session.json"
+LOCKFILE      = ".kite_bridge.lock"
 NIFTY50_TOKEN = 256265   # NSE:NIFTY 50 — stable across all KiteConnect accounts
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
@@ -211,7 +212,7 @@ def consumer_loop(bootstrap: str):
                 rtt_ms  = (time.time() - sent_at) * 1000 if sent_at else None
                 sym     = tick.get("symbol", "?")
                 ltp     = tick.get("last_price", 0.0)
-                vol     = tick.get("volume", 0)
+                vol     = tick.get("volume_traded", 0)
 
                 if rtt_ms is not None:
                     colour = GREEN if rtt_ms < 50 else (YELLOW if rtt_ms < 200 else RED)
@@ -246,6 +247,17 @@ def main():
                         help=f"Kafka bootstrap server (default: {BOOTSTRAP})")
     args = parser.parse_args()
     bootstrap = args.bootstrap
+
+    if os.path.exists(LOCKFILE):
+        with open(LOCKFILE) as f:
+            old_pid = f.read().strip()
+        print(f"{RED}ERROR: Another instance may already be running (PID {old_pid}).")
+        print(f"  If that process is gone, delete {LOCKFILE} and retry.{RESET}")
+        sys.exit(1)
+    with open(LOCKFILE, "w") as f:
+        f.write(str(os.getpid()))
+    import atexit
+    atexit.register(lambda: os.path.exists(LOCKFILE) and os.remove(LOCKFILE))
 
     required = [API_KEY, API_SECRET, USER_ID, PASSWORD, TOTP_SECRET]
     if not all(required):
@@ -301,7 +313,7 @@ def main():
             token = tick["instrument_token"]
             sym   = token_map.get(token, "UNKNOWN")
             ltp   = tick.get("last_price", 0)
-            vol   = tick.get("volume", 0)
+            vol   = tick.get("volume_traded", 0)
             ohlc  = tick.get("ohlc", {})
             chg   = tick.get("change", 0)
 
@@ -309,7 +321,7 @@ def main():
                 "symbol":           sym,
                 "instrument_token": token,
                 "last_price":       ltp,
-                "volume":           vol,
+                "volume_traded":    vol,
                 "ohlc": {
                     "open":  ohlc.get("open", 0),
                     "high":  ohlc.get("high", 0),

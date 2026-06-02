@@ -93,13 +93,15 @@ class PersistenceConsumer:
             timestamp_ns = int(dt.timestamp() * 1e9)
 
             # InfluxDB line protocol: measurement,tags fields timestamp
+            # instrument_token is a field (not a tag) so Zerodha token reassignments
+            # don't fragment the series — symbol is the stable series key.
             line = (
                 f"ticks,"
-                f"symbol={symbol},"
-                f"instrument_token={tick.get('instrument_token', 0)} "
+                f"symbol={symbol} "
                 f"last_price={tick.get('last_price', 0)},"
-                f"volume={tick.get('volume', 0)},"
-                f"change={tick.get('change', 0)} "
+                f"volume={tick.get('volume_traded', 0)},"
+                f"change={tick.get('change', 0)},"
+                f"instrument_token={tick.get('instrument_token', 0)}i "
                 f"{timestamp_ns}"
             )
             return line

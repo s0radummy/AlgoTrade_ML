@@ -1,33 +1,187 @@
 # AlgoTrading — Status
 
-_Last updated: 2026-05-28 (session 4 — architecture overhaul)_
-
-**Project:** Real-time stock price prediction system for Nifty 50. Live market ticks stream via KiteConnect WebSocket → Kafka → three consumers: a Temporal Fusion Transformer (TFT) inference engine that predicts 5-minute-ahead log-return quantiles, a Redis state aggregator for the UI, and an InfluxDB persistence layer. Deployed on a single machine via Docker Compose.
+_Last updated: 2026-06-02 (session 5)_
 
 ---
 
-## Sub-task Status
+## 1. What This Project Is For
 
-| # | Component | Goal | Status |
-|---|-----------|------|--------|
-| 1 | KiteConnect WebSocket | Stream 50 Nifty stocks live, <100ms RTT | ✅ Done — avg 27.6ms, tested live |
-| 2 | Kafka Pipeline | Reliable tick delivery, per-stock ordering | ✅ Done — 1576 ticks confirmed, p50 15.3ms RTT |
-| 3 | Redis Consumer | Rolling bar cache + live bar per symbol | ✅ Overhauled — `STOCK:*:current_bar` (tick-level) + `STOCK:*:bars` (300-bar rolling list, AOF-persistent) |
-| 4 | InfluxDB Consumer | Persist all ticks to time-series DB | ✅ Done — 97% survival rate after dedup fix |
-| 5 | Unit Tests | TFT forward pass + validator tests green | ✅ Done — 5/5 passing |
-| 6 | Historical Data | 3yr 1-min OHLCV for all Nifty 50 + index | ✅ Done — 47/50 stocks + NIFTY50 (277K candles) |
-| 7 | TFT Architecture | Full paper impl, correct I/O shapes | ✅ Done — 462K params, output `(B,5,5)` verified |
-| 8 | Dataset Loader | Sliding window with all 11 features, train/val split | ✅ Done — gap detection, z-scoring, walk-forward support |
-| 9 | TFT Training | 47-stock model with improving val loss | ✅ Done — full run complete, best val=0.213697, p50_std peaked 0.095, checkpoint safe for inference |
-| 10 | Inference Consumer | Reads Redis bars, detects minute boundary, runs TFT | ✅ Overhauled — reads `STOCK:*:bars` from Redis; `_warm_start_from_influxdb` deleted; ~370 lines removed |
-| 11 | Viz Consumer | Single bar-builder for entire system | ✅ Overhauled — owns BarAccumulator; writes `current_bar` every tick + `bars` list every minute |
-| 12 | Persistence Consumer | Kafka → InfluxDB batch writes | ✅ Fixed — offset commit added; ready to test live |
-| 13 | Model Manager | Load TFT weights, serve predictions, Redis cache | ✅ Fixed — lazy init applied; ready to test live |
-| 14 | FastAPI | `/predict`, `/health`, `/history` endpoints | ✅ Written — untested (`/history` stub incomplete) |
-| 15 | Docker Compose | Full pipeline orchestrated, all services healthy | ⚠️ Partial — Kafka partitions fixed (25); Dockerfiles for producer/consumer still unverified |
-| 16 | Walk-forward Eval | Consistent directional accuracy >50% across regimes | ✅ Done — 52.65% mean dir. accuracy, std 0.37%, range 52.18–53.18% across 6 windows |
-| 17 | Live Inference Test | `PRED:*:quantiles` in Redis within 60min of market open | ✅ Done — 143K+ ticks processed, all 47 stocks predicting live |
-| 18 | Streamlit Dashboard | Hybrid heatmap+table UI with candlestick drill-down | ✅ Updated — Stock Detail now shows 30 completed 1-min bars + live bar; reads new Redis keys |
+The end goal is precise and narrow: **for each of 47 Nifty 50 stocks, produce a calibrated probability distribution over where the stock's price is likely to land one minute from now** — continuously, in real time, throughout the entire trading session (09:15–15:30 IST).
+
+This is not a binary "up or down" signal. The system outputs five quantile forecasts — P10, P30, P50, P70, P90 — for each of the next five one-minute bars. Reading them together tells you not just the most probable direction, but also how wide the range of outcomes is, and how asymmetric the distribution is. A forecast where P50 = +0.4% and P10 = +0.1% is a high-confidence bullish signal with a tight lower bound. A forecast where P50 = +0.4% but P10 = −0.6% means the upside is the median expectation but there is significant downside tail risk — a very different trading situation, even though the P50 is identical.
+
+Concretely: every time a one-minute bar completes for a stock, the system reads the last 60 completed bars from Redis, constructs an 11-feature time-series tensor, attaches static stock metadata (sector, market cap) and forward-looking calendar features (time-of-day, day-of-week), and passes the whole thing through a 462,000-parameter Temporal Fusion Transformer. The model returns five quantile log-return forecasts for each of the next five minutes. These are denormalized back to absolute ₹ price space and written to Redis. The process repeats for all 47 stocks, independently, on every minute boundary — meaning the entire prediction surface across the portfolio refreshes every minute.
+
+The underlying model was trained on three years of 1-minute OHLCV data for all 47 stocks simultaneously. It learned price dynamics, volume patterns, sector co-movement, and intraday time structure. The Nifty 50 index (NIFTY50) is ingested as a market-wide feature (column 10 of every stock's input tensor), giving the model a live read on broad market direction during inference.
+
+The practical output: at any moment during market hours, for any of the 47 tracked stocks, you can see exactly what the model believes the next five minutes will look like — with calibrated confidence bands. Walk-forward validation on the trained checkpoint confirms 52.65% directional accuracy across six non-overlapping 14-day windows. Quantile calibration is excellent: P10 empirically covers 10.7% of outcomes, P90 covers 89.6%.
+
+---
+
+## 2. Accessing the System
+
+The entire system runs locally. Start all services with `docker-compose up -d` and run `kite_to_kafka.py` to begin the live feed. Two interfaces are available:
+
+### Streamlit Dashboard — `localhost:8501`
+
+Run with `streamlit run scripts/dashboard.py`. Auto-refreshes every 2 seconds by default (adjustable 1–30s slider in the sidebar, pauseable).
+
+**Market Overview → Table View**
+A live table of all 47 stocks showing LTP, open/high/low/close, volume, and percentage change. Rows are color-coded green (gaining) or red (losing) per cell. Filterable by All / Gainers / Losers. Sortable by sector, symbol, LTP, or change. Clicking any row selects that stock and syncs the sidebar and Stock Detail tab.
+
+**Market Overview → Heatmap View**
+A Plotly treemap of all 47 stocks. Cell size is proportional to trading volume; cell color is the percentage change on a red–green diverging scale. Sectors are grouped. Gives an instant visual read on where money is flowing in the session. Clicking a cell selects the stock.
+
+**Stock Detail Tab**
+A per-stock drill-down showing:
+- A 30-bar 1-minute candlestick chart sourced from Redis (`STOCK:{sym}:bars`). Completed bars are green (up) or red (down); the live in-progress bar is rendered in blue (up) or orange (down) and updates every refresh cycle.
+- A session sparkline tracking LTP from session start, accumulated in browser state.
+- Day-level OHLCV stats (open, high, low, close, volume, change%) from KiteConnect.
+
+**TFT Predictions Tab**
+Refreshes every 60 seconds (aligned to the 1-minute bar cadence, not the 2-second market data refresh):
+- A full P10/P30/P50/P70/P90 table for all 47 stocks simultaneously.
+- A stock-specific forecast chart in ΔPrice space: Y-axis is ₹ change from current LTP, zero line is the current price. Bars extend up (bullish) or down (bearish). Green = positive P50, red = negative P50.
+- A per-step quantile table below the chart showing compounded implied prices for each of the five forecast steps.
+- A market-wide P50 direction strip at the bottom showing the directional lean across all 47 stocks at a glance.
+
+**Sidebar**
+Stock selector dropdown (all 47), LTP, full OHLCV detail, sector badge, and a compact colored prediction pill (↑ Bullish / ↓ Bearish + magnitude %) when predictions are available.
+
+### FastAPI REST API — `localhost:8000`
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | System health (Redis, model loaded, last tick timestamp) |
+| `GET /predict/{symbol}` | Latest P10–P90 quantile forecast for a stock |
+| `GET /model/version` | Checkpoint metadata (epoch, val loss, p50_std) |
+| `GET /history/{symbol}` | Last 24h tick history from InfluxDB _(stub — incomplete)_ |
+
+Authentication via `X-API-Key` header (set in `.env`).
+
+---
+
+## 3. Project Architecture
+
+### Data Ingestion
+
+`scripts/kite_to_kafka.py` authenticates with Zerodha KiteConnect fully automatically: POST to `/api/login` (password), POST to `/api/twofa` (TOTP generated from the base32 secret in `.env`), follow the OAuth redirect to capture `request_token`, exchange for `access_token`. The session is cached in `.kite_session.json` and reused for the rest of the trading day.
+
+After auth, it resolves instrument tokens for all 47 stocks via `kite.quote()` and subscribes via `KiteTicker`. Stocks are set to `MODE_FULL` (full tick data: LTP, OHLCV, volume, change). The Nifty 50 index (token `256265`) is added separately in `MODE_QUOTE`. Every incoming tick is serialized to JSON and produced to Kafka with the instrument token as the partition key, ensuring strict chronological ordering per stock across the session.
+
+A background consumer thread reads back from Kafka and computes round-trip latency. Measured live: avg 27.6ms RTT.
+
+### Message Bus (Kafka)
+
+Topic: `stock-quotes`, 25 partitions (2:1 stock-to-partition ratio for 47 stocks). Three independent consumer groups create a fan-out: `viz-grp`, `inference-grp`, `persistence-grp`. Each consumer group processes every message independently. Within each group, messages for the same stock always land on the same partition (key-hash routing), guaranteeing per-stock FIFO ordering.
+
+Kafka is run via `confluentinc/cp-kafka:7.5.0`. Zookeeper handles coordination. The topic is auto-created at broker startup by docker-compose (`KAFKA_CREATE_TOPICS: "stock-quotes:25:1"`).
+
+### Consumer 1 — VizConsumer (`viz-grp`)
+
+The single bar-builder for the entire system. Owns a `BarAccumulator` instance per stock. For each incoming tick:
+
+1. Extracts LTP and cumulative daily volume from the tick.
+2. Checks whether the tick's minute bucket `(year, month, day, hour, minute)` has changed vs the previous tick for that stock.
+3. If the minute is new: the previous bar is completed and pushed to Redis. A new bar is opened with the current LTP as open/high/low/close and the current cumulative volume as the bar-open baseline.
+4. If the minute is the same: the running bar's high, low, close, and volume delta are updated in memory.
+5. Every tick (regardless of bar completion): writes the full live bar state to `STOCK:{sym}:current_bar` as a Redis hash. Also writes day-level KiteConnect OHLCV (the daily open/high/low/close, not the 1-minute bar) for use by the dashboard.
+
+On bar completion:
+- `LPUSH STOCK:{sym}:bars <bar_json>` — newest bar at index 0.
+- `LTRIM STOCK:{sym}:bars 0 299` — caps the list at 300 bars.
+
+Both NIFTY50 and all 47 stocks go through the same `BarAccumulator` path. Redis is configured with AOF persistence, so `STOCK:*:bars` lists survive container restarts and are available at next-day startup without any warm-start query.
+
+### Consumer 2 — InferenceConsumer (`inference-grp`)
+
+Latency-critical path. Does not build bars — it only uses ticks to detect minute-boundary crossings (by comparing the current tick's `(year, month, day, hour, minute)` against the last seen minute for that symbol). On a boundary crossing for stock `S`:
+
+1. `LINDEX STOCK:S:bars 0` — checks whether VizConsumer has already written the completed bar. If not, waits 100ms and retries once (guards against the narrow race window).
+2. `LRANGE STOCK:S:bars 0 99` — reads up to 100 most recent completed bars (newest first).
+3. `LRANGE STOCK:NIFTY50:bars 0 99` — reads Nifty50 bars for col 10 of the feature tensor.
+4. Reverses both lists (oldest first) and constructs the input tensors.
+5. Runs TFT inference (`model_manager.predict()`).
+6. Denormalizes predictions from z-score space: `pred_denorm = pred_zscore × std + mean` using per-stock stats loaded from the checkpoint at startup.
+7. Writes results to Redis: `PRED:{sym}:quantiles` (hash with P10–P90 for step 1) and `PRED:{sym}:steps` (JSON with all 5 steps).
+
+**Feature tensor construction (past_inputs: 60 × 11):**
+
+| Col | Feature | How computed |
+|-----|---------|-------------|
+| 0 | `log_ret` | `log(close / prev_close)`, then z-scored per stock |
+| 1 | `open_ret` | `log(open / prev_close)` |
+| 2 | `high_ret` | `log(high / prev_close)` |
+| 3 | `low_ret` | `log(low / prev_close)` |
+| 4 | `intraday_ret` | `log(close / open)` |
+| 5 | `intraday_rng` | `log(high / low)` |
+| 6 | `vol_norm` | `log1p(bar_vol / mean_bar_vol)` |
+| 7 | `rsi_14` | Wilder RSI on all available bars |
+| 8 | `macd_hist_norm` | MACD histogram / close, on all available bars |
+| 9 | `atr_norm` | ATR(14) / close, on all available bars |
+| 10 | `nifty_log_ret` | `log(nifty_close[t] / nifty_close[t-1])` |
+
+Cols 7–9 are computed on all available bars (not just the 60-bar window) to ensure MACD has a full 26-bar slow EMA warmup. The result is then trimmed to the last 60 values.
+
+**Static covariates (32 dims):** stock identity hash, sector ordinal, log-normalized market cap, sector one-hot (10 sectors), historical return volatility, market-cap bucket one-hot (8 buckets), reserved zeros.
+
+**Future inputs (5 × 4):** sin/cos of intraday time fraction, weekday normalized (0–1), day-of-month normalized (0–1).
+
+NIFTY50 ticks are filtered out before inference (only used as a market feature via `STOCK:NIFTY50:bars`, never run through the TFT directly).
+
+### Consumer 3 — PersistenceConsumer (`persistence-grp`)
+
+Buffers ticks in memory (default batch size: 1000) and flushes to InfluxDB as line protocol when the batch is full or on shutdown. Converts tick timestamp from ISO 8601 to epoch nanoseconds (UTC-aware, no IST offset shift). Commits Kafka offsets only after a successful InfluxDB write, giving at-least-once delivery semantics. On write failure, the batch is retained and retried on the next flush.
+
+InfluxDB measurement: `ticks`. Tags: `symbol`. Fields: `last_price`, `volume`, `change`, `instrument_token` (int).
+
+### Redis Key Schema
+
+| Key | Type | Written by | Read by | Notes |
+|-----|------|-----------|---------|-------|
+| `STOCK:{sym}:current_bar` | Hash | VizConsumer (every tick) | Dashboard, InferenceConsumer | LTP, bar OHLCV, day OHLCV, Last_Updated |
+| `STOCK:{sym}:bars` | List (max 300) | VizConsumer (every bar) | InferenceConsumer, Dashboard | Newest at index 0; AOF-persistent |
+| `PRED:{sym}:quantiles` | Hash | InferenceConsumer | Dashboard, API | P10–P90 for step 1, timestamp |
+| `PRED:{sym}:steps` | String (JSON) | InferenceConsumer | Dashboard, API | All 5 steps × 5 quantiles + LTP snapshot |
+
+### TFT Model
+
+462,464-parameter Temporal Fusion Transformer — strict implementation of Lim et al. (2021).
+
+**Input:** `static_cov (B, 32)`, `past_inputs (B, 60, 11)`, `future_inputs (B, 5, 4)`.  
+**Output:** `(B, 5, 5)` — 5 forecast steps × 5 quantiles (P10, P30, P50, P70, P90) in z-scored log-return space.
+
+Internal components:
+- **GRN (Gated Residual Network):** ELU activation → linear → GLU gate → residual add → LayerNorm. Optional context vector injection. Used throughout as the core non-linear unit.
+- **VSN (Variable Selection Network):** per-variable GRN + softmax importance weighting → learned feature selection.
+- **Static covariate encoder:** produces four context vectors from static inputs — used to initialize LSTM hidden/cell states, enrich temporal features, and weight variable selection.
+- **LSTM encoder (past, 60 steps) + decoder (future, 5 steps):** initialized from static context vectors.
+- **Post-LSTM gating + skip connection.**
+- **Static enrichment layer:** GRN with static context injected.
+- **Temporal multi-head self-attention (4 heads):** attends across the full 65-step sequence (60 past + 5 future).
+- **Post-attention gating + skip connection.**
+- **Position-wise GRN feed-forward.**
+- **Pre-output gating + skip connection.**
+- **Linear quantile head:** projects to 5 quantiles per step.
+
+Loss function: quantile (pinball) loss across all five quantiles, summed. A soft diversity penalty is added to prevent quantile collapse (penalizes P90 − P10 < 0.05).
+
+### Docker Compose
+
+Eight services on a shared `algotrade-network` bridge network:
+
+| Service | Image | Port | Role |
+|---------|-------|------|------|
+| `zookeeper` | confluentinc/cp-zookeeper:7.5.0 | 2181 | Kafka coordination |
+| `kafka` | confluentinc/cp-kafka:7.5.0 | 9092, 29092 | Message broker |
+| `redis` | redis:7.2-alpine | 6379 | Shared bar cache + prediction state |
+| `influxdb` | influxdb:2.7-alpine | 8086 | Time-series tick persistence |
+| `viz-consumer` | Dockerfile.consumer | — | Bar builder (VizConsumer) |
+| `inference-consumer` | Dockerfile.consumer | — | TFT inference (InferenceConsumer) |
+| `persistence-consumer` | Dockerfile.consumer | — | InfluxDB writer (PersistenceConsumer) |
+| `api` | Dockerfile.api | 8000 | FastAPI REST server |
+
+All services have health checks. Redis and InfluxDB use named Docker volumes for persistence. `kite_to_kafka.py` runs outside Docker on the host, connecting to Kafka via `localhost:29092`.
 
 ---
 
@@ -47,181 +201,77 @@ _Last updated: 2026-05-28 (session 4 — architecture overhaul)_
 
 ### What was broken and how it was fixed (2026-05-20)
 
-Three confirmed bugs were in `src/models/training.py` across all previous runs:
+Three confirmed bugs in `src/models/training.py` across all previous runs:
 
-1. **Adam + weight_decay = silent prediction collapse.** `Adam(weight_decay=1e-4)` applies L2 regularisation inside the adaptive update. Once the model's output predictions start converging, the output head gradients shrink, Adam's internal momentum amplifies the L2 force, and weights get pushed to zero — making predictions even more constant. A feedback loop. Fix: switched to `AdamW` (decoupled weight decay), which breaks the loop. Validated against the pytorch-forecasting reference library, which defaults to `weight_decay=0` precisely because of this fragility.
+1. **Adam + weight_decay = silent prediction collapse.** `Adam(weight_decay=1e-4)` applies L2 regularization inside the adaptive update. Once output predictions converge, output-head gradients shrink, Adam's internal momentum amplifies the L2 force, and weights are pushed toward zero — making predictions even more constant. A feedback loop. Fix: switched to `AdamW` (decoupled weight decay), which breaks the loop.
 
-2. **Gradient clipping at 1.0 instead of 0.1.** The reference library recommends `gradient_clip_val=0.1`. Clipping at 1.0 allows 10x larger gradient steps through the attention layers, which can cause attention entropy collapse (the model fixates on a single position in its context window). Fix: `max_norm=1.0` → `max_norm=0.1`.
+2. **Gradient clipping at 1.0 instead of 0.1.** The reference library recommends `gradient_clip_val=0.1`. Clipping at 1.0 allows 10× larger gradient steps through attention layers, which can cause attention entropy collapse. Fix: `max_norm=1.0` → `max_norm=0.1`.
 
-3. **No collapse early-warning.** The existing alarm only fired at `p50_std < 1e-4` — far too late (Run 3 collapse started at epoch 1 and the alarm would have fired ~20 hours later). Fix: added monotonic decline detection (3 consecutive epoch drops triggers immediate warning).
+3. **No collapse early-warning.** The alarm only fired at `p50_std < 1e-4` — far too late (Run 3 collapse started at epoch 1). Fix: added monotonic decline detection (3 consecutive drops triggers immediate warning).
 
-Additional safeguards added: soft quantile spread diversity loss (penalises P90−P10 < 0.05), checkpoint p50_std guard (auto-skips warm-start if saved checkpoint has collapsed predictions), `--no-warmstart` CLI flag.
+Additional safeguards: soft quantile diversity loss (penalizes P90−P10 < 0.05), checkpoint p50_std guard (auto-skips warm-start if saved checkpoint has collapsed predictions), `--no-warmstart` CLI flag.
 
 ### Why early stopping at epoch 19 is expected, not a bug
 
-Full Run 4 best val was epoch 4 (0.213697). Val loss then oscillated in a 0.0003 band for 15 epochs without improving — patience=15 fired correctly. The tight band means the model reached its genuine generalisation ceiling early; the remaining epochs improved training fit but not held-out performance. This is normal for stock log-return prediction. The checkpoint is at the best generalisation point.
+Full Run 4 best val was epoch 4 (0.213697). Val loss then oscillated in a 0.0003 band for 15 epochs without improving — patience=15 fired correctly. The tight band means the model reached its genuine generalization ceiling early. This is normal for stock log-return prediction. The checkpoint is at the best generalization point.
 
 ---
 
-## Session 4 — 2026-05-28 (Architecture Overhaul)
+## Session History
 
-### Changes implemented
+**Session 3 (2026-05-26) — First live run.** Full pipeline ran end-to-end for the first time: 143K+ ticks, all 47 stocks, inference consumer predicting live. `jinja2` version mismatch found and fixed (pandas 3.0.3 requires `>=3.1.5`). Dashboard redesigned: heatmap fixed (equal-area sizing), table color coding fixed, TFT Predictions tab rebuilt with ΔPrice forecast chart and per-step quantile table. Overnight eval: 47.6% directional accuracy. Root causes identified: NIFTY50 not subscribed (col 10 was zeros throughout), and two prior days of training data had mock-producer contamination.
 
-**Architectural overhaul — Redis as shared bar cache (Option A from session 3):**
+**Session 4 (2026-05-28) — Architecture overhaul.** VizConsumer made the sole owner of `BarAccumulator`; writes `STOCK:{sym}:bars` (300-bar AOF-persistent list) and `STOCK:{sym}:current_bar` (live tick hash) to Redis. InferenceConsumer refactored to read bars from Redis — `_warm_start_from_influxdb` (~160 lines) deleted entirely. NIFTY50 token 256265 subscribed; col 10 is now real data. Mock producer infrastructure removed. Dashboard Stock Detail rebuilt with 30-bar candlestick from Redis.
 
-- **VizConsumer** is now the single bar-builder for the entire system. It owns `BarAccumulator` (moved from InferenceConsumer). Every tick writes `STOCK:{sym}:current_bar` (running OHLCV + day-level KiteConnect data). Every completed bar does `LPUSH STOCK:{sym}:bars` + `LTRIM` to 300. Handles all 47 stocks + NIFTY50 identically.
-
-- **InferenceConsumer** now reads bars from Redis instead of maintaining private in-memory accumulators. `_warm_start_from_influxdb` (~160 lines) deleted entirely — Redis AOF persistence means 300 bars from the previous session survive overnight automatically. Startup is instant. Minute-boundary detection via Kafka tick timestamps triggers `LRANGE STOCK:{sym}:bars 0 99` + inference. ~370 lines net removed.
-
-- **Redis key schema changed:**
-
-  | Key | Type | Written by | Read by |
-  |-----|------|-----------|---------|
-  | `STOCK:{sym}:current_bar` | Hash | VizConsumer (every tick) | Dashboard, InferenceConsumer |
-  | `STOCK:{sym}:bars` | List max 300 | VizConsumer (every bar) | InferenceConsumer, Dashboard |
-  | `PRED:{sym}:quantiles` | Hash | InferenceConsumer | Dashboard |
-  | `PRED:{sym}:steps` | String JSON | InferenceConsumer | Dashboard |
-
-  Old `STOCK:{sym}` tick hash removed entirely.
-
-- **`redis_client.py`** — added `lpush`, `ltrim`, `lrange`, `lindex` methods to the wrapper.
-
-- **Dashboard** — `fetch_stocks()` now reads `STOCK:*:current_bar`; symbol discovery updated; NIFTY50 filtered from table. Stock Detail tab replaced single-candle day chart with a 30-bar 1-min candlestick chart (completed bars in green/red + live current bar in blue/orange, updated every tick).
-
-**Nifty50 subscription added (2026-05-28):**
-- `kite_to_kafka.py` now subscribes token 256265 (`NSE:NIFTY 50`) in `MODE_QUOTE`. VizConsumer writes `STOCK:NIFTY50:bars` — col 10 (nifty_log_ret) in the TFT input tensor is now real data instead of zeros.
-
-**Mock infrastructure removed:**
-- Deleted `scripts/producer.py`, `scripts/kafka_live_view.py`, `docker/Dockerfile.producer`, producer service from `docker-compose.yml`.
-
-### Overnight eval — 2026-05-27 session
-- 47.6% directional accuracy (below 52.65% walk-forward benchmark)
-- Likely causes: col 10 (Nifty50 log returns) was zeros throughout the session since NIFTY50 was not subscribed; mock producer contamination on 2026-05-26 (two prior days of training data were partly synthetic)
-- Quantile calibration remains excellent (P10 empirical 10.7%, P90 89.6%)
-
----
-
-## Session 3 — 2026-05-27 (First Full Live Session)
-
-### What ran today
-- Full pipeline live for the first time end-to-end: KiteConnect → Kafka → inference consumer + persistence consumer + viz consumer → Redis → Streamlit dashboard
-- All 47 Nifty 50 stocks streaming live, inference consumer processed 143,000+ ticks
-- InfluxDB persistence confirmed working — data stored for overnight evaluation
-- `jinja2` version mismatch found and fixed (`pandas 3.0.3` requires `>=3.1.5`, had `3.1.4`)
-
-### Dashboard redesign (session 3)
-
-**Market Overview table:**
-- Fixed blank heatmap — was using `values=volume` but all volumes reported as 0 at session start; switched to equal-area sizing (`values=[1]*n_stocks`), all 47 boxes now always visible
-- Fixed color coding — `Symbol`, `LTP`, `Dir` columns now colored green/red by gain/loss direction (was plain white); required `jinja2>=3.1.5`
-
-**TFT Predictions tab — full redesign:**
-- Inference consumer now stores all 5 prediction steps (`PRED:{symbol}:steps` as JSON) in addition to existing single-step hash — previously only t+1 was stored, t+2 through t+5 were computed but discarded
-- Dedicated `@st.fragment(run_every=60)` for TFT tab — previously inside the 2-second market data fragment, making the chart reload every 2 seconds and resetting zoom/pan; now refreshes every 60 seconds (aligned with 1-minute bar prediction cadence)
-- Stock picker inside the TFT tab (all 47 symbols), syncs with sidebar
-- Forecast chart redesigned to ΔPrice space: Y-axis = ₹ change from current LTP, zero line = current price, green bar extends up (bullish), red bar extends down (bearish) — eliminates the previous confusion where a "green" bar appeared to straddle the zero line
-- Per-step quantile table below chart with compounded implied prices
-- Market-wide P50 direction strip at bottom
-- Sidebar prediction mini-chart replaced with a compact colored pill (↑ Bullish / ↓ Bearish + %)
-
-### Architectural gap identified
-The viz consumer only writes the **latest tick state** to Redis (`STOCK:{SYMBOL}` — one hash, overwritten every tick). It does not accumulate bar history. The inference consumer does **not** read bars from Redis — it maintains its own private in-memory `BarAccumulator` per stock, built live from Kafka ticks, and warm-starts from InfluxDB on startup.
-
-This means **Redis is not being used as the shared bar cache** as originally intended. The dashboard has no access to historical bar data without querying InfluxDB. The intended architecture (viz consumer writes rolling bar history to Redis → inference consumer reads from Redis → dashboard reads same bars for chart context) was never built.
-
-**Pending decision:** (a) refactor viz consumer to maintain rolling bar lists in Redis and have inference consumer read from Redis, or (b) keep inference consumer's private in-memory accumulators and just add a tick history list to Redis purely for dashboard use.
-
----
-
-## UI / Dashboard
-
-**File:** `scripts/dashboard.py` — run with `streamlit run scripts/dashboard.py`
-
-**Design basis:** Researched Bloomberg Terminal, TradingView, Zerodha Kite, Finviz, and UX literature on real-time financial dashboards. Conclusion: hybrid table + heatmap + drill-down is optimal for 50 stocks.
-
-| Tab | What it shows |
-|-----|---------------|
-| Market Overview → Table View | All/Gainers/Losers filter; sorted sector → symbol; row click selects stock |
-| Market Overview → Heatmap View | Plotly Treemap — cell size = volume, color = Chg% (red↔green); click to select stock |
-| Stock Detail | 30-bar 1-min candlestick from Redis (completed bars + live bar in blue) + session sparkline + TFT quantile scatter |
-| TFT Predictions | Full P10–P90 table for all stocks; populates once inference consumer is running |
-
-**Sidebar:** LTP/OHLCV detail for selected stock, sector badge, stock switcher dropdown, TFT horizontal bar chart (when predictions available).
-
-**Auto-refresh:** 1–30s slider (default 2s), pauseable. Session sparklines accumulate LTP history in `st.session_state` (up to ~6.7 min at 2s refresh).
-
-**Dependencies:** Requires `jinja2>=3.1.5` for pandas `.style` color coding (pandas 3.0.3 enforces this minimum). Previously had 3.1.4 which silently broke all table styling.
+**Session 5 (2026-06-02) — InfluxDB series fragmentation fix.** Diagnosed that `instrument_token` stored as an InfluxDB tag caused series splits whenever Zerodha reassigns token values — confirmed across 6 stocks (ASIANPAINT, INFY, LT, RELIANCE, TCS, WIPRO) which had accumulated 3 series each (mock-producer era, sessions 3–4, session 5). Fixed by moving `instrument_token` from tag to field in `PersistenceConsumer.tick_to_line_protocol()` — `symbol` is now the sole series key. Added a PID lockfile to `kite_to_kafka.py` to prevent double-run scenarios that exacerbate the issue.
 
 ---
 
 ## Known Issues / Open Questions
 
-### Active
-
-- **47.6% live dir. accuracy vs 52.65% benchmark** — first live session underperformed. Root causes: col 10 was zeros (Nifty50 not subscribed), and two prior training-data days had mock-producer contamination. Fixed in session 4. Next live session should produce a cleaner result.
-- **Fan chart not yet implemented** — TFT Predictions tab uses bar/whisker chart in ΔPrice space. Proper P10–P90 filled cone with historical bar context not yet built (Redis bar history is now available).
-- **3 missing stocks** — LTIM, TATAMOTORS, ZOMATO excluded from checkpoint `target_stats`. Do not add until data is fetched and model is retrained.
-- **`/history` endpoint stub** — `src/api/app.py` has the endpoint wired but InfluxDB query is incomplete; returns placeholder data.
-- **Docker Compose Dockerfiles** — `docker/Dockerfile.consumer` untested in a full `docker-compose up` end-to-end run.
-- **`instrument_loader` tokens** — all instrument tokens set to `0` (placeholder). Does not block live inference since inference consumer now reads from Redis by symbol string, not token.
-
-### Fixed (2026-05-28)
-
-- ~~Redis not used as shared bar cache~~ — VizConsumer now builds bars and writes `STOCK:*:bars` (300-bar rolling list) + `STOCK:*:current_bar`. InferenceConsumer reads from Redis.
-- ~~InferenceConsumer warm-start requires InfluxDB~~ — `_warm_start_from_influxdb` deleted; Redis AOF persistence handles overnight bar survival automatically.
-- ~~col 10 always zeros in live inference~~ — NIFTY50 token 256265 now subscribed in `kite_to_kafka.py`, bars stored in `STOCK:NIFTY50:bars`.
-- ~~Dashboard shows only latest-tick data, no bar history~~ — Stock Detail tab now shows 30-bar 1-min candlestick chart from Redis.
-- ~~Mock producer in docker-compose~~ — `producer` service, `scripts/producer.py`, `scripts/kafka_live_view.py`, `docker/Dockerfile.producer` all deleted.
-
-### Fixed (2026-05-23)
-
-- ~~Module-load singletons~~ — `model_manager` and `instrument_loader` now use lazy init; importing either file no longer connects to Redis or loads PyTorch.
-- ~~Missing offset commit~~ — `persistence_consumer.py` now calls `consumer.commit()` after each successful InfluxDB write.
-- ~~Kafka partition count~~ — `docker-compose.yml` now sets `KAFKA_CREATE_TOPICS: "stock-quotes:25:1"`; topic is created with 25 partitions at broker startup. ⚠️ Run `docker-compose down -v` if you have an existing volume with 1 partition.
-- ~~`instrument_loader.py` hardcodes 6 stocks~~ — now derives all 47 stocks from `STOCK_META` via `settings.stock_list`.
-- ~~`settings.py` hardcodes 6 stocks~~ — default expanded to all 47 trained stocks.
-- ~~Walk-forward eval bug~~ — `_build_window_dataset` in `evaluate_model.py` had `val_days`/`val_start_days` swapped, returning 0 windows. Fixed.
-- ~~`.env` stock list wrong~~ — had 50 stocks including 4 not in the trained model (BPCL, SHREECEM, TATAMOTORS, UPL) and missing BEL. Corrected to exactly the 47 trained stocks.
-- ~~`kite_to_kafka.py` fallback~~ — default stock list was 3 stocks hardcoded. Updated fallback to all 47 trained stocks.
-- ~~`.env.example` stock list~~ — updated from old 6-stock placeholder to all 47 trained stocks.
+- **47.6% live accuracy vs 52.65% benchmark** — first live session underperformed due to col 10 zeros and mock-producer data contamination. Both fixed as of session 4. Session 5 (today) is the first clean live run.
+- **Fan chart not implemented** — TFT Predictions tab uses a bar/whisker chart in ΔPrice space. A proper P10–P90 filled cone with historical bar context to the left has not been built. Redis bar history is available.
+- **3 missing stocks** — LTIM, TATAMOTORS, ZOMATO have no `target_stats` in the checkpoint. Do not add until data is fetched and model is retrained.
+- **`/history` endpoint stub** — `src/api/app.py` has the route wired but the InfluxDB query is incomplete.
+- **Docker Compose end-to-end untested** — `docker/Dockerfile.consumer` has not been tested in a full `docker-compose up` run.
+- **`instrument_loader` tokens all zero** — placeholder values; does not affect live inference since the inference consumer looks up stocks by symbol string, not token.
 
 ---
 
-## Pre-flight Checklist (complete before next market session)
+## File Directory
 
-| # | Item | Status |
-|---|------|--------|
-| ✅ | Walk-forward eval passed (52.65% mean dir. accuracy, std 0.37%) | Done |
-| ✅ | `.env` STOCKS corrected to 47 trained stocks (removed BPCL, SHREECEM, TATAMOTORS, UPL; added BEL) | Done |
-| ✅ | `kite_to_kafka.py` fallback updated to 47 stocks | Done |
-| ✅ | All code bugs fixed (singletons, offset commit, Kafka partitions, eval script) | Done |
-| ⬜ | KiteConnect credentials confirmed in `.env` (API key, secret, user ID, password, **TOTP base32 secret**) | Manual — must verify before live run |
-| ⬜ | `docker-compose down -v` run once to clear old Kafka volume | One-time — do before first `docker-compose up` |
-| ⬜ | `pip install -r requirements.txt` confirmed up to date | Run once to confirm |
+### Real-Time (market hours)
 
-> **TOTP note:** `KITE_TWO_FA` must be the base32 *secret* from your authenticator app setup (long string like `JBSWY3DPEHPK3PXP`), not the rotating 6-digit code. `kite_to_kafka.py` uses `pyotp` to generate the code automatically.
+| File | Purpose |
+|------|---------|
+| `scripts/kite_to_kafka.py` | Authenticates with KiteConnect, subscribes to 47 stocks + NIFTY50, streams live ticks to Kafka |
+| `src/consumers/viz_consumer.py` | Builds 1-minute OHLCV bars from ticks (BarAccumulator), writes bar history and live bar state to Redis |
+| `src/consumers/inference_consumer.py` | Detects minute boundaries from Kafka ticks, reads Redis bars, runs TFT inference, writes quantile predictions to Redis |
+| `src/consumers/persistence_consumer.py` | Batches ticks from Kafka and writes them to InfluxDB for historical storage |
+| `src/api/app.py` | FastAPI server exposing `/predict`, `/health`, `/model/version` endpoints over REST |
+| `scripts/dashboard.py` | Streamlit UI: market overview table/heatmap, stock detail candlestick chart, TFT predictions tab |
+| `scripts/live_terminal.py` | Terminal-based live tick display for quick monitoring without the full dashboard |
+| `scripts/verify_consumers.py` | Health check script: validates consumer group lag, Redis key presence, and model file |
+| `src/models/model_manager.py` | Singleton that lazy-loads the TFT checkpoint, runs inference, caches predictions in Redis, and handles circuit-breaker fallback |
+| `src/core/redis_client.py` | Thread-safe Redis connection pool singleton with all required key operations |
+| `src/core/kafka_producer.py` | Kafka producer wrapper with reconnect backoff (used in tests; not the live producer) |
+| `src/data/tick_validator.py` | Validates incoming tick dicts for required fields, data types, value ranges, and price-change outliers |
+| `config/settings.py` | Pydantic BaseSettings loaded from `.env`; single source of truth for all service addresses, credentials, and tuning knobs |
 
-## Next Steps
+### Overnight / Training
 
-1. **Live session validation** _(next market day — session 5)_
-   - Run with new architecture: NIFTY50 subscribed, col 10 real data, Redis bar cache live
-   - Check inference triggers at every minute boundary (logs should show `_trigger_inference` calls)
-   - Confirm `STOCK:*:bars` populating in Redis (`redis-cli LLEN STOCK:RELIANCE:bars` should reach 60+ within first hour)
-   - Run overnight eval after close: expect dir. accuracy closer to 52.65% benchmark now that col 10 is real
-
-2. **TFT fan chart** _(dashboard — Redis bar data now available)_
-   - Proper P10–P90 filled cone, P30–P70 inner band, P50 line
-   - Show last 5 completed bars as context to the left of the forecast horizon
-   - All in absolute price (₹), Y-axis auto-fit
-
-3. **overnight_eval.py cleanup** _(deferred)_
-   - Update default date from 2026-05-26 → today's date (dynamic)
-   - Fetch real NIFTY50 bars from InfluxDB for col 10 in feature matrix
-
-4. **Docker Compose end-to-end** _(Phase 4)_
-   ```
-   docker-compose down -v    # clears old Kafka volume — one-time
-   docker-compose up -d
-   docker-compose ps         # all services should show healthy
-   ```
-   _`docker/Dockerfile.consumer` untested end-to-end — may need minor path/dependency fixes._
+| File | Purpose |
+|------|---------|
+| `src/models/tft_model.py` | Full TFT architecture: GRN, VSN, LSTM encoder/decoder, multi-head attention, quantile output head |
+| `src/models/training.py` | TFTTrainer: QuantileLoss, AdamW optimizer, CosineAnnealingLR, early stopping, collapse detection, checkpoint save |
+| `src/data/dataset.py` | TFTDataset: sliding 60-bar windows, 11-feature engineering, z-scoring, gap detection, walk-forward split support |
+| `src/data/features.py` | Standalone functions for RSI, MACD histogram, and ATR — shared by both training (dataset.py) and live inference |
+| `src/data/instrument_loader.py` | Stock metadata cache (sector, market cap embeddings); seeded from hardcoded STOCK_META dict, cached in Redis |
+| `scripts/fetch_historical_data.py` | Downloads 3 years of 1-minute OHLCV from the Zerodha API for all 47 stocks + NIFTY50 index; saves as parquet |
+| `scripts/evaluate_model.py` | Walk-forward validation: directional accuracy, MAE, RMSE, quantile calibration across 6 non-overlapping 14-day windows |
+| `scripts/overnight_eval.py` | Post-market evaluation comparing the day's live predictions against actual closing returns |
+| `scripts/backfill_redis_bars.py` | One-time utility: seeds `STOCK:{sym}:bars` in Redis from InfluxDB history (used after Redis wipe or first setup) |
+| `scripts/generate_model.py` | Generates a random (untrained) TFT checkpoint for pipeline testing without a full training run |
+| `scripts/test_kafka.py` | Kafka connectivity smoke test |
+| `tests/test_tft_model.py` | Unit tests for TFT forward pass: output shape (B, 5, 5), no NaNs, device portability |
+| `tests/test_validators.py` | Unit tests for tick validation: required fields, type coercion, outlier rejection, batch processing |
